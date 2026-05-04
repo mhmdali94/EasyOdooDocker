@@ -3,7 +3,7 @@
 #   ODOO DOCKER MANAGER - Interactive Management Script
 #   Supports: Odoo 16, 17, 18 | Multi-instance | Auto-fix
 #
-#   Author:  Mohamed Ali
+#   Author:  Mohammed Ali
 #   Website: https://prismatechwork.com
 #   GitHub:  https://github.com/mhmdali94/EasyOdooDocker
 # ============================================================
@@ -1041,6 +1041,149 @@ show_port_map() {
   pause
 }
 
+# ── INSTALL NGINX PROXY MANAGER ──────────────────────────────
+install_npm() {
+  echo ""
+  print_step "Checking Nginx Proxy Manager..."
+
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^nginx-proxy-manager$"; then
+    local state; state=$(docker inspect --format='{{.State.Status}}' nginx-proxy-manager 2>/dev/null)
+    print_warn "Nginx Proxy Manager container already exists (status: ${state})"
+    read -rp "  Reinstall / recreate it? [y/N]: " ans
+    [[ ! "$ans" =~ ^[Yy]$ ]] && return
+    docker rm -f nginx-proxy-manager 2>/dev/null
+  fi
+
+  local npm_dir="${BASE_DIR}/nginx-proxy-manager"
+  mkdir -p "$npm_dir/data" "$npm_dir/letsencrypt"
+
+  cat > "$npm_dir/docker-compose.yml" <<'EOF'
+# Nginx Proxy Manager
+services:
+  app:
+    image: jc21/nginx-proxy-manager:latest
+    container_name: nginx-proxy-manager
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "81:81"
+      - "443:443"
+    volumes:
+      - ./data:/data
+      - ./letsencrypt:/etc/letsencrypt
+EOF
+
+  print_step "Starting Nginx Proxy Manager..."
+  cd "$npm_dir" && dc up -d
+
+  if docker inspect --format='{{.State.Status}}' nginx-proxy-manager 2>/dev/null | grep -q "running"; then
+    local vps_ip; vps_ip=$(get_vps_ip)
+    echo ""
+    print_success "Nginx Proxy Manager is running!"
+    echo ""
+    echo -e "  ${CYAN}${BOLD}  ╔══════════════════════════════════════════╗"
+    echo -e "  ║  🌐  NGINX PROXY MANAGER ACCESS           ║"
+    echo -e "  ╠══════════════════════════════════════════╣"
+    printf "  ${CYAN}║  %-18s ${GREEN}%-23s${CYAN}║\n" "Admin UI:" "http://${vps_ip}:81"
+    printf "  ${CYAN}║  %-18s ${YELLOW}%-23s${CYAN}║\n" "Default email:" "admin@example.com"
+    printf "  ${CYAN}║  %-18s ${YELLOW}%-23s${CYAN}║\n" "Default password:" "changeme"
+    echo -e "  ${CYAN}╚══════════════════════════════════════════╝${NC}"
+    echo ""
+    print_warn "Change the default credentials immediately after first login!"
+  else
+    print_error "Container failed to start. Check: cd ${npm_dir} && docker compose logs"
+  fi
+}
+
+# ── INSTALL PORTAINER ─────────────────────────────────────────
+install_portainer() {
+  echo ""
+  print_step "Checking Portainer..."
+
+  if docker ps -a --format '{{.Names}}' 2>/dev/null | grep -q "^portainer$"; then
+    local state; state=$(docker inspect --format='{{.State.Status}}' portainer 2>/dev/null)
+    print_warn "Portainer container already exists (status: ${state})"
+    read -rp "  Reinstall / recreate it? [y/N]: " ans
+    [[ ! "$ans" =~ ^[Yy]$ ]] && return
+    docker rm -f portainer 2>/dev/null
+  fi
+
+  local port=9000
+  if is_port_used "$port"; then
+    print_warn "Port 9000 is in use — trying 9001..."
+    port=9001
+  fi
+
+  print_step "Creating Portainer volume..."
+  docker volume create portainer_data 2>/dev/null
+
+  print_step "Starting Portainer on port ${port}..."
+  docker run -d \
+    --name portainer \
+    --restart unless-stopped \
+    -p "${port}:9000" \
+    -p 9443:9443 \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -v portainer_data:/data \
+    portainer/portainer-ce:latest
+
+  if docker inspect --format='{{.State.Status}}' portainer 2>/dev/null | grep -q "running"; then
+    local vps_ip; vps_ip=$(get_vps_ip)
+    echo ""
+    print_success "Portainer is running!"
+    echo ""
+    echo -e "  ${CYAN}${BOLD}  ╔══════════════════════════════════════════╗"
+    echo -e "  ║  🐳  PORTAINER ACCESS                     ║"
+    echo -e "  ╠══════════════════════════════════════════╣"
+    printf "  ${CYAN}║  %-18s ${GREEN}%-23s${CYAN}║\n" "HTTP UI:" "http://${vps_ip}:${port}"
+    printf "  ${CYAN}║  %-18s ${GREEN}%-23s${CYAN}║\n" "HTTPS UI:" "https://${vps_ip}:9443"
+    printf "  ${CYAN}║  %-18s ${YELLOW}%-23s${CYAN}║\n" "Setup:" "Create admin on first visit"
+    echo -e "  ${CYAN}╚══════════════════════════════════════════╝${NC}"
+  else
+    print_error "Container failed to start. Check: docker logs portainer"
+  fi
+}
+
+# ── INSTALL TOOLS MENU ────────────────────────────────────────
+install_tools_menu() {
+  print_banner
+  echo -e "  ${WHITE}${BOLD}🛠️   INSTALL OPTIONAL TOOLS${NC}"
+  print_line
+  echo ""
+
+  # Show current status
+  local npm_status portainer_status
+  npm_status=$(docker inspect --format='{{.State.Status}}' nginx-proxy-manager 2>/dev/null || echo "not installed")
+  portainer_status=$(docker inspect --format='{{.State.Status}}' portainer 2>/dev/null || echo "not installed")
+
+  local npm_color="${RED}"; [[ "$npm_status" == "running" ]] && npm_color="${GREEN}"
+  local pt_color="${RED}";  [[ "$portainer_status" == "running" ]] && pt_color="${GREEN}"
+
+  echo -e "  ${CYAN}Tool                  Status${NC}"
+  print_line
+  printf "  ${WHITE}%-22s${NC} ${npm_color}%s${NC}\n" "Nginx Proxy Manager" "$npm_status"
+  printf "  ${WHITE}%-22s${NC} ${pt_color}%s${NC}\n" "Portainer" "$portainer_status"
+  echo ""
+  print_line
+  echo ""
+  echo -e "  ${GREEN}1)${NC} Install Nginx Proxy Manager  ${GRAY}(reverse proxy + SSL, ports 80/81/443)${NC}"
+  echo -e "  ${GREEN}2)${NC} Install Portainer             ${GRAY}(Docker web UI, port 9000)${NC}"
+  echo -e "  ${GREEN}3)${NC} Install Both"
+  echo -e "  ${GRAY}0) Back${NC}"
+  echo ""
+  read -rp "  Choice [0-3]: " tchoice
+
+  case $tchoice in
+    1) install_npm    ;;
+    2) install_portainer ;;
+    3) install_npm && echo "" && install_portainer ;;
+    0) return ;;
+    *) print_error "Invalid choice" ;;
+  esac
+
+  pause
+}
+
 # ── MAIN MENU ─────────────────────────────────────────────────
 main_menu() {
   while true; do
@@ -1063,11 +1206,12 @@ main_menu() {
     echo -e "  ${YELLOW}8)${NC} 🔧  Fix addons not loading"
     echo -e "  ${RED}9)${NC} 🗑️   Delete instance"
     echo -e "  ${GRAY}10)${NC} 📥  Import existing instance"
+    echo -e "  ${BLUE}11)${NC} 🛠️   Install optional tools ${GRAY}(Nginx Proxy Manager / Portainer)${NC}"
     echo ""
     print_line
     echo -e "  ${GRAY}0) Exit${NC}"
     echo ""
-    read -rp "  $(echo -e "${WHITE}Choose [0-10]: ${NC}")" choice
+    read -rp "  $(echo -e "${WHITE}Choose [0-11]: ${NC}")" choice
 
     case $choice in
       1)  create_instance ;;
@@ -1080,6 +1224,7 @@ main_menu() {
       8)  fix_addons ;;
       9)  delete_instance ;;
       10) import_existing ;;
+      11) install_tools_menu ;;
       0)  echo -e "\n  ${GREEN}Goodbye!${NC}\n"; exit 0 ;;
       *)  print_error "Invalid choice"; sleep 1 ;;
     esac

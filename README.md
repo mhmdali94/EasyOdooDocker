@@ -2,7 +2,7 @@
 
 An interactive Bash script to deploy and manage multiple Odoo instances on a Linux VPS using Docker — no manual config files, no guesswork.
 
-**By [Mohamed Ali](https://prismatechwork.com) · [GitHub](https://github.com/mhmdali94/EasyOdooDocker)**
+**By [Mohammed Ali](https://prismatechwork.com) · [GitHub](https://github.com/mhmdali94/EasyOdooDocker)**
 
 ---
 
@@ -51,7 +51,7 @@ bash "Odoo Manager.sh"
 
 Launch the script and navigate the interactive menu:
 
-```
+```text
   ╔═══════════════════════════════════════════════════════╗
   ║          🐘  ODOO DOCKER MANAGER  🐘                  ║
   ║     Multi-Instance | Auto-Fix | Smart Port Assign     ║
@@ -91,7 +91,7 @@ Access your instance at `http://YOUR_SERVER_IP:PORT` once it's up (~30 seconds o
 
 Each instance is stored under `~/docker/<name>/`:
 
-```
+```text
 ~/docker/odoo17/
 ├── docker-compose.yml   # Auto-generated
 ├── config/
@@ -112,16 +112,16 @@ Each instance is stored under `~/docker/<name>/`:
 
 ## Port Reservations
 
-| Port | Reserved for |
-|------|-------------|
-| 80   | Nginx HTTP  |
+| Port | Reserved for           |
+|------|------------------------|
+| 80   | Nginx HTTP             |
 | 81   | Nginx Proxy Manager UI |
-| 443  | Nginx HTTPS |
-| 22   | SSH |
-| 3306 | MySQL |
-| 5432 | PostgreSQL |
-| 8080 | Common web services |
-| 8888 | Common web services |
+| 443  | Nginx HTTPS            |
+| 22   | SSH                    |
+| 3306 | MySQL                  |
+| 5432 | PostgreSQL             |
+| 8080 | Common web services    |
+| 8888 | Common web services    |
 
 Odoo instances are assigned free ports starting from **8069** (web) and **8072** (longpoll/gevent).
 
@@ -129,17 +129,17 @@ Odoo instances are assigned free ports starting from **8069** (web) and **8072**
 
 ## Supported Distros
 
-| Distro | Auto-install Docker |
-|--------|-------------------|
-| Ubuntu / Debian / Linux Mint / Pop!_OS | ✅ |
-| CentOS / RHEL / Rocky / AlmaLinux / Fedora | ✅ |
-| Other | ✅ (via get.docker.com) |
+| Distro                                      | Auto-install Docker     |
+|---------------------------------------------|-------------------------|
+| Ubuntu / Debian / Linux Mint / Pop!_OS      | ✅                      |
+| CentOS / RHEL / Rocky / AlmaLinux / Fedora  | ✅                      |
+| Other                                       | ✅ (via get.docker.com) |
 
 ---
 
 ## Author
 
-**Mohamed Ali**
+**Mohammed Ali**
 - Website: [prismatechwork.com](https://prismatechwork.com)
 - GitHub: [github.com/mhmdali94](https://github.com/mhmdali94)
 
