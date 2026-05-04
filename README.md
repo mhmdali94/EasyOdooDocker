@@ -16,6 +16,7 @@ An interactive Bash script to deploy and manage multiple Odoo instances on a Lin
 - **Addons auto-fix** — diagnoses and repairs broken custom module setups in one click
 - **Import existing** — register an already-running docker-compose Odoo setup
 - **Port map** — see all registered and system-used ports at a glance
+- **Optional tools installer** — install Nginx Proxy Manager and/or Portainer as Docker containers with a single menu choice
 - **Nginx Proxy Manager aware** — ports 80, 81, 443 are permanently reserved
 
 ---
@@ -72,6 +73,7 @@ Launch the script and navigate the interactive menu:
   8) 🔧  Fix addons not loading
   9) 🗑️   Delete instance
   10) 📥  Import existing instance
+  11) 🛠️  Install optional tools (Nginx Proxy Manager / Portainer)
 ```
 
 ### Creating an instance
@@ -84,6 +86,27 @@ Launch the script and navigate the interactive menu:
 6. Confirm — the script pulls the image, generates all config files, and starts the containers
 
 Access your instance at `http://YOUR_SERVER_IP:PORT` once it's up (~30 seconds on first run).
+
+---
+
+## Optional Tools
+
+Access via **11) Install optional tools** from the main menu. The script checks if the tool is already installed and asks before proceeding.
+
+### Nginx Proxy Manager
+
+A Docker-based reverse proxy with a web UI for managing domains, SSL certificates, and proxying your Odoo instances behind a clean URL.
+
+- Ports: `80` (HTTP), `81` (Admin UI), `443` (HTTPS)
+- Installed to: `~/docker/nginx-proxy-manager/`
+- Default login: `admin@example.com` / `changeme` — **change immediately after first login**
+
+### Portainer
+
+A web UI for managing all Docker containers, images, volumes, and networks on your server.
+
+- Port: `9000` (HTTP) / `9443` (HTTPS)
+- No default credentials — you create the admin account on first visit
 
 ---
 
