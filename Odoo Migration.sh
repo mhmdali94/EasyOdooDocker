@@ -385,6 +385,7 @@ _src_list_dbs_native() {
 
 _src_pick_database() {
   local dbs=$1
+  local hint=$2   # DB name hint extracted from running postgres workers
   if [[ -z "$dbs" ]]; then
     print_warn "Could not list databases automatically"
     read -rp "  Enter database name to migrate: " SRC_DB_NAME
@@ -392,15 +393,21 @@ _src_pick_database() {
   else
     echo ""
     echo -e "  ${CYAN}  Databases found:${NC}"
-    local i=1
+    local i=1 default_ch=1
     declare -A _dbmap
     while IFS= read -r db; do
       [[ -z "$db" ]] && continue
-      echo "    ${i}) ${db}"
+      # Mark the DB that matches the active postgres connection hint
+      if [[ -n "$hint" && "$hint" == *"$db"* ]]; then
+        echo -e "  ${GREEN}  ${i}) ${db}  ← active (detected from running processes)${NC}"
+        default_ch=$i
+      else
+        echo "    ${i}) ${db}"
+      fi
       _dbmap[$i]=$db
       ((i++))
     done <<< "$dbs"
-    read -rp "  Choose database to migrate [1]: " ch; ch=${ch:-1}
+    read -rp "  Choose database to migrate [${default_ch}]: " ch; ch=${ch:-$default_ch}
     SRC_DB_NAME="${_dbmap[$ch]}"
     [[ -z "$SRC_DB_NAME" ]] && { print_error "Invalid choice"; return 1; }
   fi
@@ -432,23 +439,49 @@ setup_source() {
   echo ""
 
   # ── Detect source type ────────────────────────────────────────
-  # Priority 1: Odoo Manager Docker instances on this machine
+
+  # Priority 1: Read running processes — fastest and most reliable
+  # ps aux directly shows the config file path and active DB names
+  print_step "Scanning running Odoo processes..."
+  local found_conf=""
+  local proc_conf proc_db_hint
+
+  # Extract config path from Odoo process: looks for -c /path/to/config
+  proc_conf=$(ps aux 2>/dev/null \
+    | grep -v grep \
+    | grep -E 'odoo-bin|odoo\.py|openerp-server|odoo-server' \
+    | grep -oP '(?<=-c\s)\S+' | head -1)
+  [[ -z "$proc_conf" ]] && proc_conf=$(ps aux 2>/dev/null \
+    | grep -v grep \
+    | grep -E 'python.*odoo|python.*openerp' \
+    | grep -oP '(?<=-c\s)\S+' | head -1)
+
+  # Extract active DB names from PostgreSQL worker processes
+  # Format: "postgres: VER/main: USER DBNAME [host] state"
+  proc_db_hint=$(ps aux 2>/dev/null \
+    | grep -v grep \
+    | grep -oP 'postgres: [^:]+: \S+ \K\S+(?= \[)' \
+    | grep -v '^postgres$' | sort -u | tr '\n' ' ' | xargs)
+
+  # Show what was found in the process list
+  if [[ -n "$proc_conf" && -f "$proc_conf" ]]; then
+    found_conf="$proc_conf"
+    echo -e "  ${GREEN}  ✔ Running Odoo process detected${NC}"
+    echo -e "  ${GRAY}    Config:    ${found_conf}${NC}"
+    [[ -n "$proc_db_hint" ]] && \
+      echo -e "  ${GRAY}    Active DB: ${proc_db_hint}${NC}"
+  elif [[ -n "$proc_conf" ]]; then
+    echo -e "  ${YELLOW}  Process found but config file not readable: ${proc_conf}${NC}"
+  else
+    echo -e "  ${GRAY}  No running Odoo process found (Odoo may be stopped or running in Docker)${NC}"
+  fi
+  echo ""
+
+  # Priority 2: Odoo Manager Docker instances on this machine
   local local_meta="$HOME/docker/.odoo_manager_instances"
   local has_docker_instances=false
   if [[ -f "$local_meta" ]] && grep -q . "$local_meta" 2>/dev/null; then
     has_docker_instances=true
-  fi
-
-  # Priority 2: Read the running Odoo process — most reliable method
-  # ps aux shows exactly which config file the live Odoo process is using
-  local found_conf=""
-  local proc_conf
-  proc_conf=$(ps aux 2>/dev/null \
-    | grep -E '[Oo]doo.*-c |[Oo]doo-bin.*-c |[Oo]penERP.*-c ' \
-    | grep -oP '\-c\s+\K\S+' | grep -v '^$' | head -1)
-  if [[ -n "$proc_conf" && -f "$proc_conf" ]]; then
-    found_conf="$proc_conf"
-    print_success "Detected from running process: ${found_conf}"
   fi
 
   # Priority 3: Standard paths — covers common install conventions
@@ -599,7 +632,7 @@ setup_source() {
     echo ""
     print_step "Listing databases inside Docker container '${SRC_DOCKER_CONTAINER_DB}'..."
     local dbs; dbs=$(_src_list_dbs_docker)
-    _src_pick_database "$dbs" || return 1
+    _src_pick_database "$dbs" "$proc_db_hint" || return 1
 
   # ── Branch: Traditional server Odoo (auto-found conf) ─────────
   elif [[ "$src_type" == "1" || "$src_type" == "server" ]]; then
@@ -622,7 +655,7 @@ setup_source() {
     echo ""
     print_step "Listing databases..."
     local dbs; dbs=$(_src_list_dbs_native)
-    _src_pick_database "$dbs" || return 1
+    _src_pick_database "$dbs" "$proc_db_hint" || return 1
 
     SRC_ADDONS_PATHS=()
     if [[ -n "$addons_path" ]]; then
@@ -653,7 +686,7 @@ setup_source() {
     echo ""
     print_step "Listing databases..."
     local dbs; dbs=$(_src_list_dbs_native)
-    _src_pick_database "$dbs" || return 1
+    _src_pick_database "$dbs" "$proc_db_hint" || return 1
 
     SRC_ADDONS_PATHS=()
     if [[ -n "$addons_path" ]]; then
