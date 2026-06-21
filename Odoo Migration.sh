@@ -1515,15 +1515,28 @@ run_hop_on_destination() {
   local ou_img="${OPENUPGRADE_IMG}:${hop_ver}"
   local std_img="odoo:${hop_ver}"
 
-  # Decide which image to use
+  # Try to use OpenUpgrade — it handles cross-version schema conflicts that native Odoo can't
   local use_img="$std_img"
-  if dst_sh "docker image inspect '$ou_img'" &>/dev/null 2>&1 \
-      || dst_sh "docker pull '$ou_img'" &>/dev/null 2>&1; then
+  print_step "Checking for OpenUpgrade image: ${ou_img} ..."
+  if dst_sh "docker image inspect '${ou_img}' > /dev/null 2>&1"; then
     use_img="$ou_img"
-    print_step "Using OpenUpgrade image: ${use_img}"
+    print_success "OpenUpgrade image already cached — using it"
   else
-    print_step "Using native Odoo image: ${use_img}"
+    print_info "Pulling OpenUpgrade image (this may take a few minutes)..."
+    local pull_ok=0
+    local pull_out
+    pull_out=$(dst_sh "docker pull '${ou_img}' 2>&1" || true)
+    echo "$pull_out" | grep -qiE "Downloaded newer image|Image is up to date|Pull complete" && pull_ok=1
+    if [[ $pull_ok -eq 1 ]]; then
+      use_img="$ou_img"
+      print_success "OpenUpgrade image pulled — using it"
+    else
+      print_warn "OpenUpgrade image NOT available for ${hop_ver} — falling back to native Odoo"
+      print_warn "Reason: $(echo "$pull_out" | tail -2 | tr '\n' ' ')"
+      print_warn "Pre-hop SQL patches will be applied to compensate."
+    fi
   fi
+  echo -e "  ${CYAN}ℹ  Image: ${use_img}${NC}"
 
   echo ""
   echo -e "  ${GRAY}  Legend: ${RED}ERR${NC} ${YELLOW}WARN${NC} ${GREEN}OK${NC} ${GRAY}INFO${NC}"
@@ -1624,10 +1637,35 @@ run_hop_on_destination() {
   return $?
 }
 
+pre_hop_sql_patches() {
+  local hop_ver=$1 db=$2 prev_ver=$3
+
+  # Run SQL fixes before a hop to avoid known cross-version conflicts that
+  # native Odoo cannot handle (OpenUpgrade patches these automatically).
+
+  # ── 14 → 15: mail.catchall keys conflict ──────────────────────────────────
+  # In Odoo 14 the mail module creates mail.catchall.alias / mail.catchall.domain
+  # without an ir_model_data entry under module='base'. Odoo 15's base module
+  # then tries to INSERT them as new records → UniqueViolation.
+  # Fix: delete the rows so Odoo 15 can create them fresh with correct metadata.
+  # The default values (catchall / empty) are restored automatically by Odoo.
+  if [[ "$prev_ver" == "14"* ]] && [[ "$hop_ver" == "15.0" ]]; then
+    print_info "Pre-hop patch (14→15): removing conflicting ir.config.parameter rows..."
+    dst_sh "docker exec \
+      -e PGPASSWORD='${DST_PG_PASS}' \
+      '${DST_INSTANCE_NAME}-db' \
+      psql -U '${DST_PG_USER}' -d '${db}' -q \
+      -c \"DELETE FROM ir_config_parameter WHERE key IN ('mail.catchall.alias','mail.catchall.domain');\"" \
+      >> "$MIGRATION_LOG" 2>&1 || true
+    print_success "Pre-hop patch applied — Odoo 15 will re-create those parameters with defaults"
+  fi
+}
+
 run_all_hops() {
   local db=$1
   local total=${#HOP_LIST[@]}
   local current=1
+  local prev_ver="$SRC_VERSION"
 
   for hop_ver in "${HOP_LIST[@]}"; do
     echo ""
@@ -1648,6 +1686,9 @@ run_all_hops() {
       && print_success "Rollback point: ${hop_bk}" \
       || print_warn "Rollback point save failed (continuing anyway)"
 
+    # Apply known cross-version SQL compatibility patches before the hop
+    pre_hop_sql_patches "$hop_ver" "$db" "$prev_ver"
+
     # run_hop_on_destination streams logs, calls show_hop_summary, and returns
     # 0 (continue) or 1 (user chose to stop after seeing errors)
     if ! run_hop_on_destination "$hop_ver" "$db"; then
@@ -1657,6 +1698,7 @@ run_all_hops() {
       return 1
     fi
 
+    prev_ver="$hop_ver"
     ((current++))
   done
   return 0
