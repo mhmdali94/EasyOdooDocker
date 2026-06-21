@@ -1113,6 +1113,8 @@ create_destination_instance() {
   # Create directories on destination
   print_step "Creating directories on destination..."
   dst_sh "mkdir -p '${DST_INSTANCE_DIR}/addons' '${DST_INSTANCE_DIR}/config' '${DST_INSTANCE_DIR}/logs'"
+  # Odoo container runs as uid 101 — must own logs and addons or it can't write
+  dst_sh "chown -R 101:101 '${DST_INSTANCE_DIR}/logs' '${DST_INSTANCE_DIR}/addons' 2>/dev/null || true"
 
   # Generate docker-compose.yml locally and copy to destination
   print_step "Writing docker-compose.yml on destination..."
@@ -1184,7 +1186,7 @@ db_host = db
 db_port = 5432
 db_user = ${DST_PG_USER}
 db_password = ${DST_PG_PASS}
-db_name = False
+db_name =
 admin_passwd = ${DST_MASTER_PASS}
 addons_path = /mnt/extra-addons,/usr/lib/python3/dist-packages/odoo/addons
 workers = 2
@@ -1199,10 +1201,11 @@ logfile = /var/log/odoo/odoo.log
 longpolling_port = ${DST_GEVENT_PORT}
 gevent_port = ${DST_GEVENT_PORT}
 list_db = True
-proxy_mode = True
 EOF
   dst_scp "$tmp_conf" "${DST_SSH_USER}@${DST_SSH_HOST}:${DST_INSTANCE_DIR}/config/odoo.conf"
   rm -f "$tmp_conf"
+  # Must be world-readable or Odoo container (uid 101) cannot read it
+  dst_sh "chmod 644 '${DST_INSTANCE_DIR}/config/odoo.conf'"
   print_success "odoo.conf copied to destination"
 
   # Start DB container on destination
@@ -1539,13 +1542,16 @@ run_hop_on_destination() {
 
   local _in_traceback=0
 
+  # Docker Compose prefixes the project name to network names: {project}_{network}
+  # Project name = directory name of docker-compose.yml = instance name
+  local hop_network="${DST_INSTANCE_NAME}_${DST_INSTANCE_NAME}_net"
+
   dst_sh "docker run --rm \
-    --network '${DST_INSTANCE_NAME}_net' \
+    --network '${hop_network}' \
     -e HOST=db \
     -e USER='${DST_PG_USER}' \
     -e PASSWORD='${DST_PG_PASS}' \
     -v '${DST_INSTANCE_DIR}/addons:/mnt/extra-addons' \
-    -v '${DST_INSTANCE_DIR}/config/odoo.conf:/etc/odoo/odoo.conf:ro' \
     -v '${DST_INSTANCE_DIR}/logs:/var/log/odoo' \
     '${use_img}' \
     odoo --update=all --stop-after-init \
@@ -1657,6 +1663,129 @@ run_all_hops() {
 }
 
 # ══════════════════════════════════════════════════════════════
+#  STEP 9.5 — FINALIZE ODOO 19 SCHEMA (jsonb auto-fix)
+# ══════════════════════════════════════════════════════════════
+# Odoo 19 changed the storage of Selection fields AND translated Char/Text fields
+# from varchar to jsonb.  After OpenUpgrade hops, the DB columns are still varchar
+# with raw string values like 'base', 'draft', 'Sale Order'.  Native Odoo 19
+# _auto_init tries to ALTER them with "USING col::jsonb" which fails because
+# 'base'::jsonb is invalid — it needs to be '"base"'::jsonb (a quoted JSON string).
+#
+# This function runs the Odoo 19 update in a loop, and each time a column
+# conversion fails it pre-fixes that column's values, then retries.
+#
+# Conversion rules:
+#   Selection values  ('base','draft','posted' — lowercase/digits/underscores only)
+#     → JSON string:  to_json(col)    →  "base"
+#   Translated values ('Sale Order', 'Arabic text' — anything with spaces/uppercase)
+#     → JSON object:  {"en_US": col}  →  {"en_US": "Sale Order"}
+# ──────────────────────────────────────────────────────────────
+finalize_odoo19() {
+  local db=$1
+  local max_attempts=80   # enough for hundreds of columns
+  local attempt=0
+  local net="${DST_INSTANCE_NAME}_${DST_INSTANCE_NAME}_net"
+
+  echo ""
+  print_line
+  echo -e "  ${WHITE}${BOLD}  STEP 9.5 — Finalize Odoo 19 Schema${NC}"
+  print_line
+  print_info "Odoo 19 stores Selection + translated fields as jsonb."
+  print_info "Auto-converting varchar columns one by one until the update succeeds."
+  echo ""
+
+  while [[ $attempt -lt $max_attempts ]]; do
+    ((attempt++))
+    printf "  ${CYAN}ℹ  Attempt %d/%d — running odoo --update=all --stop-after-init...${NC}\n" \
+      "$attempt" "$max_attempts"
+
+    local update_out
+    update_out=$(dst_sh "docker run --rm \
+      --network '${net}' \
+      -e HOST=db \
+      -e USER='${DST_PG_USER}' \
+      -e PASSWORD='${DST_PG_PASS}' \
+      odoo:${TARGET_VERSION} \
+      odoo --update=all --stop-after-init \
+        --db_host=db \
+        --db_user='${DST_PG_USER}' \
+        --db_password='${DST_PG_PASS}' \
+        --database='${db}' \
+        --no-http 2>&1" || true)
+
+    # Success: Odoo prints "shutdown" or "Modules loaded" on clean stop-after-init
+    if echo "$update_out" | grep -qiE "shutdown complete|modules loaded|registry loaded"; then
+      echo ""
+      print_success "Odoo 19 schema finalized after ${attempt} attempt(s)"
+      return 0
+    fi
+
+    # Check PostgreSQL logs for the specific failing ALTER TABLE ... TYPE jsonb
+    local failing_stmt
+    failing_stmt=$(dst_sh \
+      "docker logs '${DST_INSTANCE_NAME}-db' 2>&1 | grep 'STATEMENT.*TYPE jsonb' | tail -1" \
+      2>/dev/null || true)
+
+    if [[ -z "$failing_stmt" ]]; then
+      # No jsonb ALTER error — check if it was a different failure
+      if echo "$update_out" | grep -qiE "CRITICAL|Failed to initialize database"; then
+        echo ""
+        print_error "Odoo 19 update failed (not a jsonb issue). Last errors:"
+        echo "$update_out" | grep -iE "ERROR|CRITICAL" | tail -8 | \
+          while IFS= read -r l; do echo -e "  ${RED}  $l${NC}"; done
+        print_info "Full output above. Check the migration log for details."
+        return 1
+      fi
+      echo ""
+      print_success "Schema finalized (attempt ${attempt})"
+      return 0
+    fi
+
+    # Parse: ALTER TABLE "tablename" ALTER COLUMN "colname" ... TYPE jsonb
+    local tbl col
+    tbl=$(echo "$failing_stmt" | grep -oP 'ALTER TABLE "\K[^"]+(?=")')
+    col=$(echo "$failing_stmt" | grep -oP 'ALTER COLUMN "\K[^"]+(?=" (?:DROP DEFAULT,\s*)?ALTER COLUMN|(?= TYPE jsonb))')
+    # Fallback parse if above didn't capture correctly
+    [[ -z "$col" ]] && col=$(echo "$failing_stmt" | grep -oP 'ALTER COLUMN "\K[^"]+(?=" TYPE jsonb)')
+
+    if [[ -z "$tbl" || -z "$col" ]]; then
+      print_warn "Cannot parse failing statement — stopping auto-fix"
+      print_info "Statement: ${failing_stmt}"
+      return 1
+    fi
+
+    printf "  ${YELLOW}⚠  Auto-fixing: %s.%s (varchar → jsonb)${NC}\n" "$tbl" "$col"
+
+    # Convert existing varchar values to JSON-compatible text, then Odoo's ALTER will work.
+    # Selection values ('base','manual') → JSON string: "base"
+    # Translated values ('Sale Order')   → JSON object: {"en_US":"Sale Order"}
+    dst_sh "docker exec \
+      -e PGPASSWORD='${DST_PG_PASS}' \
+      '${DST_INSTANCE_NAME}-db' \
+      psql -U '${DST_PG_USER}' -d '${db}' -c \
+      \"UPDATE \\\"${tbl}\\\"
+        SET \\\"${col}\\\" = CASE
+          WHEN \\\"${col}\\\" ~ '^[a-z0-9_]+\$'
+          THEN to_json(\\\"${col}\\\")::text
+          ELSE json_build_object('en_US', \\\"${col}\\\")::text
+        END
+        WHERE \\\"${col}\\\" IS NOT NULL
+          AND \\\"${col}\\\" != ''
+          AND \\\"${col}\\\" NOT LIKE '{%'
+          AND \\\"${col}\\\" NOT LIKE '[%'
+          AND \\\"${col}\\\" NOT LIKE '\\\"%';\"" \
+      >> "$MIGRATION_LOG" 2>&1 || true
+
+    log_msg "jsonb fix: ${tbl}.${col}"
+  done
+
+  echo ""
+  print_error "Reached ${max_attempts} auto-fix attempts — stopping."
+  print_info "The database may need manual schema repair. Contact your developer."
+  return 1
+}
+
+# ══════════════════════════════════════════════════════════════
 #  STEP 10 — START & VERIFY ON DESTINATION
 # ══════════════════════════════════════════════════════════════
 post_verify() {
@@ -1728,7 +1857,8 @@ post_verify() {
   print_line
 
   if [[ -f "$ERR_LOG" ]]; then
-    local total_errors; total_errors=$(grep -c . "$ERR_LOG" 2>/dev/null || echo 0)
+    # Skip header comment lines (lines starting with #) when counting errors
+    local total_errors; total_errors=$(grep -cv '^\s*#\|^\s*$' "$ERR_LOG" 2>/dev/null || echo 0)
     if [[ "$total_errors" -eq 0 ]]; then
       print_success "Zero errors logged across all hops — clean migration"
     else
@@ -1920,6 +2050,9 @@ run_migration() {
   print_warn "Keep this terminal open — do not close it during upgrade"
   echo ""
   run_all_hops "$SRC_DB_NAME" || { pause; return; }
+
+  # ── 9.5. Finalize Odoo 19 schema (jsonb auto-fix) ───────
+  finalize_odoo19 "$SRC_DB_NAME" || { pause; return; }
 
   # ── 10. Verify ──────────────────────────────────────────
   post_verify "$SRC_DB_NAME"
