@@ -439,45 +439,104 @@ setup_source() {
     has_docker_instances=true
   fi
 
-  # Priority 2: Traditional server Odoo (native install)
+  # Priority 2: Traditional server Odoo — quick check of common paths
   local found_conf=""
   for c in /etc/odoo/odoo.conf /etc/odoo.conf /opt/odoo/odoo.conf \
             /opt/odoo/server/odoo.conf /home/odoo/odoo.conf \
-            /opt/odoo-server/odoo.conf /srv/odoo/odoo.conf; do
+            /opt/odoo-server/odoo.conf /srv/odoo/odoo.conf \
+            /var/lib/odoo/odoo.conf /root/odoo/odoo.conf; do
     [[ -f "$c" ]] && { found_conf="$c"; break; }
   done
 
-  # Show user their options
+  # Priority 3: Deep search — scan the whole filesystem if nothing found yet
+  local -a deep_found=()
+  if ! $has_docker_instances && [[ -z "$found_conf" ]]; then
+    echo -e "  ${GRAY}  Standard paths checked — nothing found. Running deep search...${NC}"
+    echo -e "  ${GRAY}  (searching filesystem for odoo.conf / openerp.conf — please wait)${NC}"
+    while IFS= read -r hit; do
+      deep_found+=("$hit")
+    done < <(find / -maxdepth 12 \( -name "odoo.conf" -o -name "openerp.conf" \) \
+               -not -path "/proc/*" \
+               -not -path "/sys/*" \
+               -not -path "/dev/*" \
+               -not -path "/run/*" \
+               -not -path "/tmp/*" \
+               -not -path "/snap/*" \
+               2>/dev/null | sort -u)
+    if [[ ${#deep_found[@]} -gt 0 ]]; then
+      found_conf="${deep_found[0]}"   # default to first hit; user can pick below
+      echo -e "  ${GREEN}  Deep search found ${#deep_found[@]} config file(s)${NC}"
+    else
+      echo -e "  ${GRAY}  Deep search complete — no odoo.conf found anywhere.${NC}"
+    fi
+    echo ""
+  fi
+
+  # Show user what was found
   echo -e "  ${CYAN}  Source type detected:${NC}"
   $has_docker_instances && \
     echo -e "  ${GREEN}  ✔ Docker instances (Odoo Manager)${NC}" || \
     echo -e "  ${GRAY}  ✗ No Odoo Manager instances found${NC}"
-  [[ -n "$found_conf" ]] && \
-    echo -e "  ${GREEN}  ✔ Traditional server Odoo: ${found_conf}${NC}" || \
-    echo -e "  ${GRAY}  ✗ No server Odoo config found in standard paths${NC}"
+  if [[ ${#deep_found[@]} -gt 1 ]]; then
+    echo -e "  ${GREEN}  ✔ ${#deep_found[@]} config files found by deep search:${NC}"
+    for f in "${deep_found[@]}"; do echo -e "  ${GRAY}      ${f}${NC}"; done
+  elif [[ -n "$found_conf" ]]; then
+    echo -e "  ${GREEN}  ✔ Traditional server Odoo: ${found_conf}${NC}"
+  else
+    echo -e "  ${GRAY}  ✗ No server Odoo config found${NC}"
+  fi
   echo ""
 
   # ── Ask which source type to use ─────────────────────────────
   local src_type=""
+
   if $has_docker_instances && [[ -n "$found_conf" ]]; then
     echo "    1) Docker instance (Odoo Manager) on this machine"
-    echo "    2) Traditional server Odoo (direct install)"
+    echo "    2) Traditional server Odoo (${found_conf})"
     echo "    3) Enter config path manually"
     read -rp "  Source type [1]: " src_type; src_type=${src_type:-1}
+
   elif $has_docker_instances; then
     echo "    1) Docker instance (Odoo Manager) on this machine"
     echo "    2) Enter config path manually"
     read -rp "  Source type [1]: " src_type; src_type=${src_type:-1}
+
+  elif [[ ${#deep_found[@]} -gt 1 ]]; then
+    # Multiple configs found — let user pick which one
+    echo -e "  ${CYAN}  Multiple odoo.conf files found — which one is the source?${NC}"
+    local fi=1
+    declare -A _confmap
+    for f in "${deep_found[@]}"; do
+      echo "    ${fi}) ${f}"
+      _confmap[$fi]="$f"
+      ((fi++))
+    done
+    echo "    ${fi}) Enter path manually"
+    read -rp "  Choose [1]: " src_type
+    if [[ "${_confmap[$src_type]}" ]]; then
+      found_conf="${_confmap[$src_type]}"
+      src_type="server"
+    else
+      src_type="manual"
+    fi
+
   elif [[ -n "$found_conf" ]]; then
     echo "    1) Traditional server Odoo (${found_conf})"
     echo "    2) Enter config path manually"
     read -rp "  Source type [1]: " src_type; src_type=${src_type:-1}
     [[ "$src_type" == "1" ]] && src_type="server"
     [[ "$src_type" == "2" ]] && src_type="manual"
+
   else
-    print_warn "Could not auto-detect any Odoo installation on this machine."
+    print_warn "No Odoo installation found anywhere on this machine."
+    echo ""
+    echo -e "  ${GRAY}  This can happen if:${NC}"
+    echo -e "  ${GRAY}  • Odoo runs inside a Docker container managed by a different tool${NC}"
+    echo -e "  ${GRAY}  • The config file has a non-standard name${NC}"
+    echo -e "  ${GRAY}  • Odoo is installed but not yet configured${NC}"
+    echo ""
     echo "    1) Enter config path manually"
-    read -rp "  Source type [1]: " src_type; src_type="manual"
+    read -rp "  Choice [1]: " _; src_type="manual"
   fi
 
   # ── Branch: Docker source ─────────────────────────────────────
