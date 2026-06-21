@@ -1,7 +1,7 @@
 #!/bin/bash
 # ============================================================
 #   ODOO DOCKER MANAGER - Interactive Management Script
-#   Supports: Odoo 16, 17, 18 | Multi-instance | Auto-fix
+#   Supports: Odoo 16, 17, 18, 19 | Multi-instance | Auto-fix
 #
 #   Author:  Mohammed Ali
 #   Website: https://prismatechwork.com
@@ -449,17 +449,19 @@ create_instance() {
   # ── Version ──
   echo ""
   echo -e "  ${CYAN}Select Odoo version:${NC}"
-  echo "  1) Odoo 18.0"
-  echo "  2) Odoo 17.0"
-  echo "  3) Odoo 16.0"
-  echo "  4) Custom version"
-  read -rp "  Choice [1-4]: " vchoice
+  echo "  1) Odoo 19.0"
+  echo "  2) Odoo 18.0"
+  echo "  3) Odoo 17.0"
+  echo "  4) Odoo 16.0"
+  echo "  5) Custom version"
+  read -rp "  Choice [1-5]: " vchoice
   case $vchoice in
-    1) version="18.0" ;;
-    2) version="17.0" ;;
-    3) version="16.0" ;;
-    4) read -rp "  Enter version (e.g. 15.0): " version ;;
-    *) version="17.0" ;;
+    1) version="19.0" ;;
+    2) version="18.0" ;;
+    3) version="17.0" ;;
+    4) version="16.0" ;;
+    5) read -rp "  Enter version (e.g. 15.0): " version ;;
+    *) version="18.0" ;;
   esac
 
   # ── Ports ──
