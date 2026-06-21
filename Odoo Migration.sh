@@ -47,15 +47,15 @@ SRC_IS_DOCKER="false"          # true = source Odoo runs in Docker on this machi
 SRC_DOCKER_CONTAINER_DB=""     # Docker container name for the source DB
 SRC_PG_AUTH_METHOD=""          # password | peer_odoo | peer_postgres
 SRC_ODOO_BIN=""                # full path to odoo-bin (detected from running process)
+SRC_MASTER_PASS=""             # admin_passwd from source odoo.conf
 declare -a SRC_ADDONS_PATHS=()
 
 # Destination (remote Docker machine)
 DST_SSH_USER=""
 DST_SSH_HOST=""
 DST_SSH_PORT="22"
-DST_SSH_KEY="$HOME/.ssh/id_rsa"
-DST_SSH_PASS=""
-USE_SSHPASS="false"
+DST_SSH_KEY=""
+DST_SSH_CTL=""      # ControlMaster socket path — all SSH calls reuse this one connection
 DST_HOME=""
 DST_BASE_DIR=""
 
@@ -288,43 +288,31 @@ show_hop_summary() {
 
 # ══════════════════════════════════════════════════════════════
 #  DESTINATION SSH HELPERS
-#  All destination operations go through these two functions.
-#  The source machine is never touched by dst_sh / dst_scp.
+#  All destination operations go through dst_sh / dst_scp / dst_rsync.
+#  They reuse a single ControlMaster connection — password typed ONCE only.
+#  The source machine is never touched by any of these functions.
 # ══════════════════════════════════════════════════════════════
-DST_SSH_OPTS="-o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=60 -o ServerAliveCountMax=10"
+
+# Base SSH options (no key or password here — auth is handled by ControlMaster)
+_DST_SSH_BASE="-o StrictHostKeyChecking=no -o ConnectTimeout=15 -o ServerAliveInterval=60 -o ServerAliveCountMax=10"
 
 dst_sh() {
-  # Run a command on the destination machine
-  if [[ "$USE_SSHPASS" == "true" ]]; then
-    sshpass -p "$DST_SSH_PASS" \
-      ssh $DST_SSH_OPTS -p "$DST_SSH_PORT" \
-      "${DST_SSH_USER}@${DST_SSH_HOST}" "$@"
-  else
-    ssh $DST_SSH_OPTS -p "$DST_SSH_PORT" -i "$DST_SSH_KEY" \
-      "${DST_SSH_USER}@${DST_SSH_HOST}" "$@"
-  fi
+  ssh $_DST_SSH_BASE \
+    -o ControlPath="$DST_SSH_CTL" \
+    -p "$DST_SSH_PORT" \
+    "${DST_SSH_USER}@${DST_SSH_HOST}" "$@"
 }
 
 dst_scp() {
-  # Copy file(s) to/from destination
-  if [[ "$USE_SSHPASS" == "true" ]]; then
-    sshpass -p "$DST_SSH_PASS" \
-      scp -o StrictHostKeyChecking=no -P "$DST_SSH_PORT" "$@"
-  else
-    scp -o StrictHostKeyChecking=no -P "$DST_SSH_PORT" -i "$DST_SSH_KEY" "$@"
-  fi
+  scp -o StrictHostKeyChecking=no \
+    -o ControlPath="$DST_SSH_CTL" \
+    -P "$DST_SSH_PORT" "$@"
 }
 
 dst_rsync() {
-  # Rsync files to destination
-  if [[ "$USE_SSHPASS" == "true" ]]; then
-    sshpass -p "$DST_SSH_PASS" \
-      rsync -az --exclude='*.pyc' --exclude='__pycache__' \
-      -e "ssh $DST_SSH_OPTS -p $DST_SSH_PORT" "$@"
-  else
-    rsync -az --exclude='*.pyc' --exclude='__pycache__' \
-      -e "ssh $DST_SSH_OPTS -p $DST_SSH_PORT -i $DST_SSH_KEY" "$@"
-  fi
+  rsync -az --exclude='*.pyc' --exclude='__pycache__' \
+    -e "ssh $_DST_SSH_BASE -o ControlPath=${DST_SSH_CTL} -p ${DST_SSH_PORT}" \
+    "$@"
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -765,7 +753,21 @@ setup_source() {
     SRC_DB_PORT=$(parse_conf_key "$SRC_ODOO_CONF" "db_port");   SRC_DB_PORT=${SRC_DB_PORT:-5432}
     SRC_DB_USER=$(parse_conf_key "$SRC_ODOO_CONF" "db_user");   SRC_DB_USER=${SRC_DB_USER:-odoo}
     SRC_DB_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "db_password")
+    SRC_MASTER_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "admin_passwd")
     local addons_path; addons_path=$(parse_conf_key "$SRC_ODOO_CONF" "addons_path")
+
+    # Ask for master password — read from config if present, otherwise ask
+    echo ""
+    if [[ -n "$SRC_MASTER_PASS" && "$SRC_MASTER_PASS" != "False" ]]; then
+      echo -e "  ${GREEN}  ✔ Master password found in odoo.conf${NC}"
+      echo -e "  ${GRAY}    It will be reused on the destination Odoo 19 instance.${NC}"
+      read -rsp "  Master password [keep current — press Enter, or type new]: " _mp; echo ""
+      [[ -n "$_mp" ]] && SRC_MASTER_PASS="$_mp"
+    else
+      echo -e "  ${YELLOW}  Master password not found in odoo.conf.${NC}"
+      read -rsp "  Enter Odoo master password (will be set on destination): " SRC_MASTER_PASS; echo ""
+      [[ -z "$SRC_MASTER_PASS" ]] && SRC_MASTER_PASS="admin"
+    fi
 
     echo ""
     print_step "Resolving PostgreSQL connection..."
@@ -797,7 +799,21 @@ setup_source() {
     SRC_DB_PORT=$(parse_conf_key "$SRC_ODOO_CONF" "db_port");   SRC_DB_PORT=${SRC_DB_PORT:-5432}
     SRC_DB_USER=$(parse_conf_key "$SRC_ODOO_CONF" "db_user");   SRC_DB_USER=${SRC_DB_USER:-odoo}
     SRC_DB_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "db_password")
+    SRC_MASTER_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "admin_passwd")
     local addons_path; addons_path=$(parse_conf_key "$SRC_ODOO_CONF" "addons_path")
+
+    # Ask for master password — read from config if present, otherwise ask
+    echo ""
+    if [[ -n "$SRC_MASTER_PASS" && "$SRC_MASTER_PASS" != "False" ]]; then
+      echo -e "  ${GREEN}  ✔ Master password found in odoo.conf${NC}"
+      echo -e "  ${GRAY}    It will be reused on the destination Odoo 19 instance.${NC}"
+      read -rsp "  Master password [keep current — press Enter, or type new]: " _mp; echo ""
+      [[ -n "$_mp" ]] && SRC_MASTER_PASS="$_mp"
+    else
+      echo -e "  ${YELLOW}  Master password not found in odoo.conf.${NC}"
+      read -rsp "  Enter Odoo master password (will be set on destination): " SRC_MASTER_PASS; echo ""
+      [[ -z "$SRC_MASTER_PASS" ]] && SRC_MASTER_PASS="admin"
+    fi
 
     echo ""
     print_step "Resolving PostgreSQL connection..."
@@ -838,52 +854,66 @@ setup_destination_ssh() {
   print_banner
   echo -e "  ${WHITE}${BOLD}🖥️   STEP 2 — Connect to Destination Machine${NC}"
   print_line
-  echo -e "  ${GRAY}This is the server where Odoo 19 Docker will be installed.${NC}"
+  echo -e "  ${GRAY}  This is the server where Odoo 19 Docker will be installed.${NC}"
+  echo -e "  ${GRAY}  You will type the SSH password ONCE — all commands reuse that connection.${NC}"
   echo ""
 
   read -rp "  Destination SSH user (e.g. root): " DST_SSH_USER
   read -rp "  Destination IP or hostname:       " DST_SSH_HOST
   read -rp "  SSH port [22]:                    " DST_SSH_PORT; DST_SSH_PORT=${DST_SSH_PORT:-22}
-  read -rp "  SSH key path [~/.ssh/id_rsa]:     " DST_SSH_KEY
-  DST_SSH_KEY="${DST_SSH_KEY:-$HOME/.ssh/id_rsa}"
 
-  echo ""
-  print_step "Testing SSH connection with key..."
-  if ssh $DST_SSH_OPTS -p "$DST_SSH_PORT" -i "$DST_SSH_KEY" \
-      "${DST_SSH_USER}@${DST_SSH_HOST}" "echo ok" &>/dev/null; then
-    print_success "Connected via SSH key"
-    USE_SSHPASS="false"
-  else
-    print_warn "SSH key auth failed — falling back to password auth."
-    if ! command -v sshpass &>/dev/null; then
-      echo ""
-      echo -e "  ${RED}  Cannot use password auth: 'sshpass' is not installed on this machine.${NC}"
-      echo -e "  ${GRAY}  This script will NOT install anything on this (production) machine.${NC}"
-      echo ""
-      echo -e "  ${YELLOW}  You have two options:${NC}"
-      echo -e "  ${WHITE}  Option 1 — SSH key (recommended, no installs needed):${NC}"
-      echo -e "  ${GRAY}    On this machine: ssh-keygen -t rsa -b 4096 -f ~/.ssh/id_rsa${NC}"
-      echo -e "  ${GRAY}    Then:            ssh-copy-id -p PORT USER@DESTINATION_IP${NC}"
-      echo -e "  ${GRAY}    Then re-run this script — key auth will succeed.${NC}"
-      echo ""
-      echo -e "  ${WHITE}  Option 2 — Install sshpass manually BEFORE running this script:${NC}"
-      echo -e "  ${GRAY}    Ubuntu/Debian:  sudo apt-get install -y sshpass${NC}"
-      echo -e "  ${GRAY}    CentOS/Rocky:   sudo yum install -y sshpass${NC}"
-      echo -e "  ${GRAY}    (This is the only package that may be needed on this machine.)${NC}"
-      echo ""
-      print_error "Aborting — please set up SSH key auth or install sshpass, then re-run."
-      return 1
+  # ── Set up ControlMaster socket path ─────────────────────────
+  # /tmp is always writable; use PID so multiple runs don't clash
+  DST_SSH_CTL="/tmp/.odoo_mig_ctl_${$}"
+
+  # ── Try SSH key first (strict — no password fallback) ─────────
+  local key_ok=false
+  read -rp "  SSH key path (press Enter to skip and use password): " DST_SSH_KEY
+  if [[ -n "$DST_SSH_KEY" && -f "$DST_SSH_KEY" ]]; then
+    print_step "Testing SSH key auth (no password fallback)..."
+    if ssh $_DST_SSH_BASE \
+        -o PasswordAuthentication=no \
+        -o BatchMode=yes \
+        -o ControlMaster=yes \
+        -o ControlPath="$DST_SSH_CTL" \
+        -o ControlPersist=7200 \
+        -p "$DST_SSH_PORT" \
+        -i "$DST_SSH_KEY" \
+        "${DST_SSH_USER}@${DST_SSH_HOST}" "echo ok" &>/dev/null; then
+      key_ok=true
+      print_success "Connected via SSH key — connection will be reused for all steps"
+    else
+      print_warn "Key auth failed — will try password"
     fi
-    read -rsp "  SSH password for ${DST_SSH_USER}@${DST_SSH_HOST}: " DST_SSH_PASS; echo ""
-    USE_SSHPASS="true"
-    if ! dst_sh "echo ok" &>/dev/null; then
-      print_error "Cannot connect to ${DST_SSH_HOST}. Check credentials."
-      return 1
-    fi
-    print_success "Connected via password"
+  elif [[ -n "$DST_SSH_KEY" ]]; then
+    print_warn "Key file '${DST_SSH_KEY}' not found — will try password"
   fi
 
-  # Get destination home directory
+  # ── Password auth using ControlMaster (typed once, reused forever) ──
+  if ! $key_ok; then
+    echo ""
+    echo -e "  ${CYAN}  Password auth — you type it ONCE below.${NC}"
+    echo -e "  ${GRAY}  All subsequent steps reuse this connection automatically.${NC}"
+    echo ""
+    # Open ControlMaster in the foreground so the user can type the password
+    ssh $_DST_SSH_BASE \
+      -o ControlMaster=yes \
+      -o ControlPath="$DST_SSH_CTL" \
+      -o ControlPersist=7200 \
+      -p "$DST_SSH_PORT" \
+      "${DST_SSH_USER}@${DST_SSH_HOST}" "echo ok" || {
+        print_error "Connection failed. Check IP, port, and password."
+        return 1
+      }
+    print_success "Connected — password will NOT be asked again during this migration"
+  fi
+
+  # ── Verify the control socket works ───────────────────────────
+  if ! dst_sh "echo ok" &>/dev/null; then
+    print_error "ControlMaster socket not working. Cannot continue."
+    return 1
+  fi
+
   DST_HOME=$(dst_sh "echo \$HOME")
   DST_BASE_DIR="${DST_HOME}/docker"
   print_success "Destination home: ${DST_HOME}"
@@ -1050,11 +1080,21 @@ create_destination_instance() {
   echo ""
   local def_pg_user="${DST_INSTANCE_NAME}_user"
   local def_pg_pass; def_pg_pass=$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 16 || echo "odoopass123")
-  local def_master;  def_master=$(tr -dc 'A-Za-z0-9'  < /dev/urandom 2>/dev/null | head -c 12 || echo "master123")
+
+  # Use the master password from the source Odoo if we have it — saves the user from re-typing it
+  local def_master="${SRC_MASTER_PASS:-}"
+  [[ -z "$def_master" ]] && def_master=$(tr -dc 'A-Za-z0-9' < /dev/urandom 2>/dev/null | head -c 12 || echo "master123")
 
   read -rp "  PostgreSQL user [${def_pg_user}]: "     DST_PG_USER;    DST_PG_USER=${DST_PG_USER:-$def_pg_user}
   read -rp "  PostgreSQL password [auto-generated]: "  DST_PG_PASS;    DST_PG_PASS=${DST_PG_PASS:-$def_pg_pass}
-  read -rp "  Odoo master password [auto-generated]: " DST_MASTER_PASS; DST_MASTER_PASS=${DST_MASTER_PASS:-$def_master}
+  if [[ -n "$SRC_MASTER_PASS" ]]; then
+    echo -e "  ${GRAY}  Master password pre-filled from source Odoo${NC}"
+    read -rsp "  Odoo master password [same as source — press Enter to keep]: " DST_MASTER_PASS; echo ""
+    DST_MASTER_PASS="${DST_MASTER_PASS:-$def_master}"
+  else
+    read -rsp "  Odoo master password: " DST_MASTER_PASS; echo ""
+    DST_MASTER_PASS="${DST_MASTER_PASS:-$def_master}"
+  fi
 
   # ── Confirm ───────────────────────────────────────────────────
   echo ""
