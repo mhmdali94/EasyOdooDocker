@@ -367,91 +367,230 @@ get_custom_addons_paths() {
   done
 }
 
-setup_source() {
-  print_banner
-  echo -e "  ${WHITE}${BOLD}📖  STEP 1 — Read Source Odoo (this machine)${NC}"
-  print_line
-  echo -e "  ${GREEN}Source machine is read-only — nothing will be modified here.${NC}"
-  echo ""
+_src_list_dbs_docker() {
+  # List databases from inside Docker container (source is Docker-based)
+  docker exec -e PGPASSWORD="$SRC_DB_PASS" "$SRC_DOCKER_CONTAINER_DB" \
+    psql -U "$SRC_DB_USER" -t \
+    -c "SELECT datname FROM pg_database WHERE datistemplate=false AND datname<>'postgres' ORDER BY datname;" \
+    2>/dev/null | tr -d ' ' | grep -v '^$'
+}
 
-  # Find config file
-  for c in /etc/odoo/odoo.conf /etc/odoo.conf /opt/odoo/odoo.conf \
-            /opt/odoo/server/odoo.conf /home/odoo/odoo.conf; do
-    [[ -f "$c" ]] && { SRC_ODOO_CONF="$c"; print_success "Found config: $c"; break; }
-  done
-
-  if [[ -z "$SRC_ODOO_CONF" ]]; then
-    print_warn "Could not auto-detect odoo.conf"
-    read -rp "  Enter full path to odoo.conf: " SRC_ODOO_CONF
-    [[ ! -f "$SRC_ODOO_CONF" ]] && { print_error "File not found"; return 1; }
-  fi
-
-  # Parse config
-  SRC_DB_HOST=$(parse_conf_key "$SRC_ODOO_CONF" "db_host");   SRC_DB_HOST=${SRC_DB_HOST:-localhost}
-  SRC_DB_PORT=$(parse_conf_key "$SRC_ODOO_CONF" "db_port");   SRC_DB_PORT=${SRC_DB_PORT:-5432}
-  SRC_DB_USER=$(parse_conf_key "$SRC_ODOO_CONF" "db_user");   SRC_DB_USER=${SRC_DB_USER:-odoo}
-  SRC_DB_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "db_password")
-  local addons_path; addons_path=$(parse_conf_key "$SRC_ODOO_CONF" "addons_path")
-
-  # DB password
-  [[ -z "$SRC_DB_PASS" ]] && {
-    read -rsp "  PostgreSQL password for '${SRC_DB_USER}': " SRC_DB_PASS; echo ""
-  }
-
-  # Detect version
-  print_step "Detecting Odoo version..."
-  SRC_VERSION=$(detect_local_version)
-  if [[ -z "$SRC_VERSION" ]]; then
-    read -rp "  Could not auto-detect version. Enter it (e.g. 17.0): " SRC_VERSION
-  else
-    print_success "Detected version: ${SRC_VERSION}"
-    read -rp "  Confirm [${SRC_VERSION}]: " inp; [[ -n "$inp" ]] && SRC_VERSION="$inp"
-  fi
-
-  # Validate range
-  local maj; maj=$(version_major "$SRC_VERSION")
-  if [[ "$maj" -lt 14 || "$maj" -ge 19 ]]; then
-    print_error "Version ${SRC_VERSION} not supported. Must be v14–v18."
-    return 1
-  fi
-
-  # List and select database
-  echo ""
-  print_step "Listing local databases..."
-  local dbs; dbs=$(PGPASSWORD="$SRC_DB_PASS" psql \
+_src_list_dbs_native() {
+  # List databases from native PostgreSQL (source is server-based)
+  PGPASSWORD="$SRC_DB_PASS" psql \
     -h "$SRC_DB_HOST" -p "$SRC_DB_PORT" -U "$SRC_DB_USER" -t \
     -c "SELECT datname FROM pg_database WHERE datistemplate=false AND datname<>'postgres' ORDER BY datname;" \
-    2>/dev/null | tr -d ' ' | grep -v '^$')
+    2>/dev/null | tr -d ' ' | grep -v '^$'
+}
 
+_src_pick_database() {
+  local dbs=$1
   if [[ -z "$dbs" ]]; then
     print_warn "Could not list databases automatically"
     read -rp "  Enter database name to migrate: " SRC_DB_NAME
     [[ -z "$SRC_DB_NAME" ]] && { print_error "Database name required"; return 1; }
   else
     echo ""
-    echo -e "  ${CYAN}Local databases:${NC}"
-    local i=1; declare -A _dbmap
+    echo -e "  ${CYAN}  Databases found:${NC}"
+    local i=1
+    declare -A _dbmap
     while IFS= read -r db; do
       [[ -z "$db" ]] && continue
-      echo "  ${i}) $db"; _dbmap[$i]=$db; ((i++))
+      echo "    ${i}) ${db}"
+      _dbmap[$i]=$db
+      ((i++))
     done <<< "$dbs"
-    read -rp "  Choose database [1]: " ch; ch=${ch:-1}
+    read -rp "  Choose database to migrate [1]: " ch; ch=${ch:-1}
     SRC_DB_NAME="${_dbmap[$ch]}"
     [[ -z "$SRC_DB_NAME" ]] && { print_error "Invalid choice"; return 1; }
   fi
+  return 0
+}
 
-  # Custom addons
-  SRC_ADDONS_PATHS=()
-  if [[ -n "$addons_path" ]]; then
-    while IFS= read -r p; do
-      [[ -n "$p" ]] && SRC_ADDONS_PATHS+=("$p")
-    done < <(get_custom_addons_paths "$addons_path")
+_src_confirm_version() {
+  local auto_ver=$1
+  if [[ -z "$auto_ver" ]]; then
+    read -rp "  Could not auto-detect version. Enter it (e.g. 17.0): " SRC_VERSION
+  else
+    print_success "Detected version: ${auto_ver}"
+    read -rp "  Confirm version [${auto_ver}]: " inp
+    SRC_VERSION="${inp:-$auto_ver}"
+  fi
+  local maj; maj=$(version_major "$SRC_VERSION")
+  if [[ "$maj" -lt 14 || "$maj" -ge 19 ]]; then
+    print_error "Version ${SRC_VERSION} is not supported. Must be v14, v15, v16, v17, or v18."
+    return 1
+  fi
+  return 0
+}
+
+setup_source() {
+  print_banner
+  echo -e "  ${WHITE}${BOLD}📖  STEP 1 — Read Source Odoo (this machine)${NC}"
+  print_line
+  echo -e "  ${GREEN}  Source machine is read-only — nothing will be modified here.${NC}"
+  echo ""
+
+  # ── Detect source type ────────────────────────────────────────
+  # Priority 1: Odoo Manager Docker instances on this machine
+  local local_meta="$HOME/docker/.odoo_manager_instances"
+  local has_docker_instances=false
+  if [[ -f "$local_meta" ]] && grep -q . "$local_meta" 2>/dev/null; then
+    has_docker_instances=true
+  fi
+
+  # Priority 2: Traditional server Odoo (native install)
+  local found_conf=""
+  for c in /etc/odoo/odoo.conf /etc/odoo.conf /opt/odoo/odoo.conf \
+            /opt/odoo/server/odoo.conf /home/odoo/odoo.conf \
+            /opt/odoo-server/odoo.conf /srv/odoo/odoo.conf; do
+    [[ -f "$c" ]] && { found_conf="$c"; break; }
+  done
+
+  # Show user their options
+  echo -e "  ${CYAN}  Source type detected:${NC}"
+  $has_docker_instances && \
+    echo -e "  ${GREEN}  ✔ Docker instances (Odoo Manager)${NC}" || \
+    echo -e "  ${GRAY}  ✗ No Odoo Manager instances found${NC}"
+  [[ -n "$found_conf" ]] && \
+    echo -e "  ${GREEN}  ✔ Traditional server Odoo: ${found_conf}${NC}" || \
+    echo -e "  ${GRAY}  ✗ No server Odoo config found in standard paths${NC}"
+  echo ""
+
+  # ── Ask which source type to use ─────────────────────────────
+  local src_type=""
+  if $has_docker_instances && [[ -n "$found_conf" ]]; then
+    echo "    1) Docker instance (Odoo Manager) on this machine"
+    echo "    2) Traditional server Odoo (direct install)"
+    echo "    3) Enter config path manually"
+    read -rp "  Source type [1]: " src_type; src_type=${src_type:-1}
+  elif $has_docker_instances; then
+    echo "    1) Docker instance (Odoo Manager) on this machine"
+    echo "    2) Enter config path manually"
+    read -rp "  Source type [1]: " src_type; src_type=${src_type:-1}
+  elif [[ -n "$found_conf" ]]; then
+    echo "    1) Traditional server Odoo (${found_conf})"
+    echo "    2) Enter config path manually"
+    read -rp "  Source type [1]: " src_type; src_type=${src_type:-1}
+    [[ "$src_type" == "1" ]] && src_type="server"
+    [[ "$src_type" == "2" ]] && src_type="manual"
+  else
+    print_warn "Could not auto-detect any Odoo installation on this machine."
+    echo "    1) Enter config path manually"
+    read -rp "  Source type [1]: " src_type; src_type="manual"
+  fi
+
+  # ── Branch: Docker source ─────────────────────────────────────
+  if [[ "$src_type" == "1" ]] && $has_docker_instances; then
+    SRC_IS_DOCKER="true"
+    echo ""
+    echo -e "  ${CYAN}  Odoo Manager instances on this machine:${NC}"
+    local idx=1
+    declare -A _instmap
+    while IFS='|' read -r m_name m_ver m_dir m_web m_gev m_pgu m_pgp _ m_st; do
+      [[ -z "$m_name" ]] && continue
+      printf "    %d) %-20s  v%-5s  [%s]\n" "$idx" "$m_name" "$m_ver" "$m_st"
+      _instmap[$idx]="$m_name|$m_ver|$m_dir|$m_pgu|$m_pgp"
+      ((idx++))
+    done < "$local_meta"
+
+    echo ""
+    read -rp "  Choose instance to migrate [1]: " ich; ich=${ich:-1}
+    local sel="${_instmap[$ich]}"
+    [[ -z "$sel" ]] && { print_error "Invalid choice"; return 1; }
+
+    IFS='|' read -r _nm _ver _dir _pgu _pgp <<< "$sel"
+    SRC_VERSION="$_ver"
+    SRC_DB_USER="$_pgu"
+    SRC_DB_PASS="$_pgp"
+    SRC_DOCKER_CONTAINER_DB="${_nm}-db"
+    SRC_ODOO_CONF="${_dir}/config/odoo.conf"
+    SRC_ADDONS_PATHS=("${_dir}/addons")
+
+    print_success "Selected: ${_nm} (v${SRC_VERSION})"
+    print_info  "DB container: ${SRC_DOCKER_CONTAINER_DB}"
+    print_info  "Addons:       ${_dir}/addons"
+
+    # Confirm version
+    _src_confirm_version "$SRC_VERSION" || return 1
+
+    # List and pick database
+    echo ""
+    print_step "Listing databases inside Docker container '${SRC_DOCKER_CONTAINER_DB}'..."
+    local dbs; dbs=$(_src_list_dbs_docker)
+    _src_pick_database "$dbs" || return 1
+
+  # ── Branch: Traditional server Odoo (auto-found conf) ─────────
+  elif [[ "$src_type" == "1" || "$src_type" == "server" ]]; then
+    SRC_IS_DOCKER="false"
+    SRC_ODOO_CONF="$found_conf"
+    print_success "Using config: ${SRC_ODOO_CONF}"
+
+    SRC_DB_HOST=$(parse_conf_key "$SRC_ODOO_CONF" "db_host");   SRC_DB_HOST=${SRC_DB_HOST:-localhost}
+    SRC_DB_PORT=$(parse_conf_key "$SRC_ODOO_CONF" "db_port");   SRC_DB_PORT=${SRC_DB_PORT:-5432}
+    SRC_DB_USER=$(parse_conf_key "$SRC_ODOO_CONF" "db_user");   SRC_DB_USER=${SRC_DB_USER:-odoo}
+    SRC_DB_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "db_password")
+    local addons_path; addons_path=$(parse_conf_key "$SRC_ODOO_CONF" "addons_path")
+    [[ -z "$SRC_DB_PASS" ]] && {
+      read -rsp "  PostgreSQL password for '${SRC_DB_USER}': " SRC_DB_PASS; echo ""
+    }
+
+    print_step "Detecting Odoo version..."
+    _src_confirm_version "$(detect_local_version)" || return 1
+
+    echo ""
+    print_step "Listing databases..."
+    local dbs; dbs=$(_src_list_dbs_native)
+    _src_pick_database "$dbs" || return 1
+
+    SRC_ADDONS_PATHS=()
+    if [[ -n "$addons_path" ]]; then
+      while IFS= read -r p; do
+        [[ -n "$p" ]] && SRC_ADDONS_PATHS+=("$p")
+      done < <(get_custom_addons_paths "$addons_path")
+    fi
+
+  # ── Branch: Manual config path ────────────────────────────────
+  else
+    SRC_IS_DOCKER="false"
+    echo ""
+    read -rp "  Full path to odoo.conf: " SRC_ODOO_CONF
+    [[ ! -f "$SRC_ODOO_CONF" ]] && { print_error "File not found: ${SRC_ODOO_CONF}"; return 1; }
+
+    SRC_DB_HOST=$(parse_conf_key "$SRC_ODOO_CONF" "db_host");   SRC_DB_HOST=${SRC_DB_HOST:-localhost}
+    SRC_DB_PORT=$(parse_conf_key "$SRC_ODOO_CONF" "db_port");   SRC_DB_PORT=${SRC_DB_PORT:-5432}
+    SRC_DB_USER=$(parse_conf_key "$SRC_ODOO_CONF" "db_user");   SRC_DB_USER=${SRC_DB_USER:-odoo}
+    SRC_DB_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "db_password")
+    local addons_path; addons_path=$(parse_conf_key "$SRC_ODOO_CONF" "addons_path")
+    [[ -z "$SRC_DB_PASS" ]] && {
+      read -rsp "  PostgreSQL password for '${SRC_DB_USER}': " SRC_DB_PASS; echo ""
+    }
+
+    print_step "Detecting Odoo version..."
+    _src_confirm_version "$(detect_local_version)" || return 1
+
+    echo ""
+    print_step "Listing databases..."
+    local dbs; dbs=$(_src_list_dbs_native)
+    _src_pick_database "$dbs" || return 1
+
+    SRC_ADDONS_PATHS=()
+    if [[ -n "$addons_path" ]]; then
+      while IFS= read -r p; do
+        [[ -n "$p" ]] && SRC_ADDONS_PATHS+=("$p")
+      done < <(get_custom_addons_paths "$addons_path")
+    fi
   fi
 
   echo ""
-  print_success "Source ready: DB='${SRC_DB_NAME}' | Version=${SRC_VERSION}"
+  print_line
+  echo -e "  ${GREEN}${BOLD}  Source confirmed (READ-ONLY):${NC}"
+  echo -e "  ${GRAY}  Type:     $( [[ "$SRC_IS_DOCKER" == "true" ]] && echo "Docker (Odoo Manager)" || echo "Traditional server" )${NC}"
+  echo -e "  ${GRAY}  Version:  ${SRC_VERSION}${NC}"
+  echo -e "  ${GRAY}  Database: ${SRC_DB_NAME}${NC}"
   [[ ${#SRC_ADDONS_PATHS[@]} -gt 0 ]] && \
-    print_info "Custom addons: ${SRC_ADDONS_PATHS[*]}"
+    echo -e "  ${GRAY}  Addons:   ${SRC_ADDONS_PATHS[*]}${NC}"
+  print_line
   return 0
 }
 
@@ -836,13 +975,26 @@ dump_source_db() {
   echo "# Destination: ${DST_SSH_USER}@${DST_SSH_HOST}" >> "$ERR_LOG"
   echo "" >> "$ERR_LOG"
 
-  # pg_dump reads the DB — does NOT modify anything
+  # pg_dump reads the DB — does NOT modify anything on the source
   print_step "Dumping '${SRC_DB_NAME}' (binary format, UTF-8/Arabic safe)..."
-  PGPASSWORD="$SRC_DB_PASS" PGCLIENTENCODING="UTF8" \
-    pg_dump \
-      -h "$SRC_DB_HOST" -p "$SRC_DB_PORT" -U "$SRC_DB_USER" \
-      -F c --no-owner --no-acl --encoding=UTF8 \
-      "$SRC_DB_NAME" > "$BACKUP_FILE"
+  if [[ "$SRC_IS_DOCKER" == "true" ]]; then
+    print_info "Source is Docker — running pg_dump inside container '${SRC_DOCKER_CONTAINER_DB}'"
+    # Stream dump from inside the container directly to a local file — nothing written inside container
+    docker exec \
+      -e PGPASSWORD="$SRC_DB_PASS" \
+      -e PGCLIENTENCODING="UTF8" \
+      "$SRC_DOCKER_CONTAINER_DB" \
+      pg_dump -U "$SRC_DB_USER" \
+        -F c --no-owner --no-acl --encoding=UTF8 \
+        "$SRC_DB_NAME" > "$BACKUP_FILE"
+  else
+    print_info "Source is server Odoo — running pg_dump locally"
+    PGPASSWORD="$SRC_DB_PASS" PGCLIENTENCODING="UTF8" \
+      pg_dump \
+        -h "$SRC_DB_HOST" -p "$SRC_DB_PORT" -U "$SRC_DB_USER" \
+        -F c --no-owner --no-acl --encoding=UTF8 \
+        "$SRC_DB_NAME" > "$BACKUP_FILE"
+  fi
 
   if [[ ! -s "$BACKUP_FILE" ]]; then
     print_error "Dump failed or empty. Check PostgreSQL credentials."
