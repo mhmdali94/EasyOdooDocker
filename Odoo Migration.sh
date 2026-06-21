@@ -439,23 +439,45 @@ setup_source() {
     has_docker_instances=true
   fi
 
-  # Priority 2: Traditional server Odoo — quick check of common paths
+  # Priority 2: Read the running Odoo process — most reliable method
+  # ps aux shows exactly which config file the live Odoo process is using
   local found_conf=""
-  for c in /etc/odoo/odoo.conf /etc/odoo.conf /opt/odoo/odoo.conf \
-            /opt/odoo/server/odoo.conf /home/odoo/odoo.conf \
-            /opt/odoo-server/odoo.conf /srv/odoo/odoo.conf \
-            /var/lib/odoo/odoo.conf /root/odoo/odoo.conf; do
-    [[ -f "$c" ]] && { found_conf="$c"; break; }
-  done
+  local proc_conf
+  proc_conf=$(ps aux 2>/dev/null \
+    | grep -E '[Oo]doo.*-c |[Oo]doo-bin.*-c |[Oo]penERP.*-c ' \
+    | grep -oP '\-c\s+\K\S+' | grep -v '^$' | head -1)
+  if [[ -n "$proc_conf" && -f "$proc_conf" ]]; then
+    found_conf="$proc_conf"
+    print_success "Detected from running process: ${found_conf}"
+  fi
 
-  # Priority 3: Deep search — scan the whole filesystem if nothing found yet
+  # Priority 3: Standard paths — covers common install conventions
+  if [[ -z "$found_conf" ]]; then
+    for c in \
+      /etc/odoo-server.conf /etc/odoo/odoo.conf /etc/odoo.conf \
+      /etc/openerp-server.conf /etc/openerp.conf \
+      /opt/odoo/odoo.conf /opt/odoo/server/odoo.conf \
+      /opt/odoo-server/odoo.conf /opt/odoo-server/odoo-server.conf \
+      /home/odoo/odoo.conf /home/odoo/odoo-server.conf \
+      /srv/odoo/odoo.conf /var/lib/odoo/odoo.conf \
+      /odoo/odoo.conf /odoo/odoo-server.conf /root/odoo/odoo.conf; do
+      [[ -f "$c" ]] && { found_conf="$c"; print_success "Found config: ${c}"; break; }
+    done
+  fi
+
+  # Priority 4: Deep search — only runs if process detection and standard paths both failed
   local -a deep_found=()
   if ! $has_docker_instances && [[ -z "$found_conf" ]]; then
     echo -e "  ${GRAY}  Standard paths checked — nothing found. Running deep search...${NC}"
-    echo -e "  ${GRAY}  (searching filesystem for odoo.conf / openerp.conf — please wait)${NC}"
+    echo -e "  ${GRAY}  (scanning filesystem for odoo*.conf / openerp*.conf — please wait)${NC}"
     while IFS= read -r hit; do
+      # Filter out fake configs: source code samples, addon tools, packaging templates
+      echo "$hit" | grep -qE '/addons/|/debian/|/posbox/|/doc/|/tests?/|/sample|/example|/template' \
+        && continue
       deep_found+=("$hit")
-    done < <(find / -maxdepth 12 \( -name "odoo.conf" -o -name "openerp.conf" \) \
+    done < <(find / -maxdepth 12 \
+               \( -name "odoo.conf" -o -name "odoo-server.conf" \
+                  -o -name "openerp.conf" -o -name "openerp-server.conf" \) \
                -not -path "/proc/*" \
                -not -path "/sys/*" \
                -not -path "/dev/*" \
@@ -464,10 +486,10 @@ setup_source() {
                -not -path "/snap/*" \
                2>/dev/null | sort -u)
     if [[ ${#deep_found[@]} -gt 0 ]]; then
-      found_conf="${deep_found[0]}"   # default to first hit; user can pick below
+      found_conf="${deep_found[0]}"
       echo -e "  ${GREEN}  Deep search found ${#deep_found[@]} config file(s)${NC}"
     else
-      echo -e "  ${GRAY}  Deep search complete — no odoo.conf found anywhere.${NC}"
+      echo -e "  ${GRAY}  Deep search complete — no Odoo config found anywhere.${NC}"
     fi
     echo ""
   fi
