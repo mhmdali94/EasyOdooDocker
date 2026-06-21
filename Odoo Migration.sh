@@ -45,6 +45,8 @@ SRC_DB_NAME=""
 SRC_VERSION=""
 SRC_IS_DOCKER="false"          # true = source Odoo runs in Docker on this machine
 SRC_DOCKER_CONTAINER_DB=""     # Docker container name for the source DB
+SRC_PG_AUTH_METHOD=""          # password | peer_odoo | peer_postgres
+SRC_ODOO_BIN=""                # full path to odoo-bin (detected from running process)
 declare -a SRC_ADDONS_PATHS=()
 
 # Destination (remote Docker machine)
@@ -347,12 +349,43 @@ parse_conf_key() {
 }
 
 detect_local_version() {
-  local v
-  v=$(odoo --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1)
-  [[ -z "$v" ]] && v=$(odoo-bin --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1)
-  [[ -z "$v" ]] && v=$(python3 -c "import odoo; print(odoo.release.series)" 2>/dev/null | grep -oP '\d+\.\d+' | head -1)
-  [[ -z "$v" ]] && v=$(dpkg -l 2>/dev/null | awk '/^ii.*odoo/{print $3}' | grep -oP '^\d+\.\d+' | head -1)
-  echo "${v:-}"
+  local v=""
+
+  # Method 1: run the exact binary detected from the running process (most reliable)
+  if [[ -n "$SRC_ODOO_BIN" && -x "$SRC_ODOO_BIN" ]]; then
+    v=$("$SRC_ODOO_BIN" --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1)
+    [[ -n "$v" ]] && { echo "$v"; return; }
+    # If --version fails (some builds don't support it), read release.py in same dir
+    local src_dir; src_dir=$(dirname "$SRC_ODOO_BIN")
+    for rel in \
+        "${src_dir}/odoo/release.py" \
+        "${src_dir}/openerp/release.py" \
+        "${src_dir}/release.py"; do
+      [[ -f "$rel" ]] && {
+        v=$(grep -oP "(?<=series\s=\s')[^']+" "$rel" 2>/dev/null \
+          || grep -oP "(?<=version\s=\s')[0-9]+\.[0-9]+" "$rel" 2>/dev/null)
+        [[ -n "$v" ]] && { echo "$v"; return; }
+      }
+    done
+  fi
+
+  # Method 2: binaries in PATH
+  for bin in odoo-bin odoo openerp-server; do
+    v=$(command -v "$bin" &>/dev/null && "$bin" --version 2>/dev/null \
+        | grep -oP '\d+\.\d+' | head -1)
+    [[ -n "$v" ]] && { echo "$v"; return; }
+  done
+
+  # Method 3: import odoo Python module (works if installed in system Python)
+  v=$(python3 -c "import odoo; print(odoo.release.series)" 2>/dev/null \
+      | grep -oP '\d+\.\d+' | head -1)
+  [[ -n "$v" ]] && { echo "$v"; return; }
+
+  # Method 4: dpkg (only works for apt-installed Odoo, not source installs)
+  v=$(dpkg -l 2>/dev/null | awk '/^ii.*odoo/{print $3}' | grep -oP '^\d+\.\d+' | head -1)
+  [[ -n "$v" ]] && { echo "$v"; return; }
+
+  echo ""
 }
 
 get_custom_addons_paths() {
@@ -367,6 +400,90 @@ get_custom_addons_paths() {
   done
 }
 
+# Wrapper: run pg command on source using whatever auth method works
+# Usage: _src_pg psql|pg_dump [extra args...]
+_src_pg() {
+  local cmd=$1; shift
+  case "$SRC_PG_AUTH_METHOD" in
+    password)
+      PGPASSWORD="$SRC_DB_PASS" PGCLIENTENCODING="UTF8" \
+        "$cmd" -h "$SRC_DB_HOST" -p "$SRC_DB_PORT" -U "$SRC_DB_USER" "$@"
+      ;;
+    peer_odoo)
+      # Run as the Odoo OS user — PG peer auth matches OS username to PG username
+      sudo -u "$SRC_DB_USER" \
+        env PGCLIENTENCODING="UTF8" \
+        "$cmd" -U "$SRC_DB_USER" "$@"
+      ;;
+    peer_postgres)
+      # Run as postgres superuser — can access any database without password
+      sudo -u postgres \
+        env PGCLIENTENCODING="UTF8" \
+        "$cmd" -U postgres "$@"
+      ;;
+  esac
+}
+
+# Detect which PostgreSQL auth method works for this server and set SRC_PG_AUTH_METHOD.
+# Only called for non-Docker sources. Tries password → peer odoo user → peer postgres user.
+_resolve_src_pg_auth() {
+  # Always connect to 'postgres' maintenance DB for the test — avoids needing
+  # a DB named after the user (e.g. 'odoo' DB may not exist on this server)
+  local test_cmd=(-d postgres -t -c "SELECT 1;")
+
+  # Method 1: password from odoo.conf (skip if empty or literal "False")
+  if [[ -n "$SRC_DB_PASS" && "$SRC_DB_PASS" != "False" ]]; then
+    if PGPASSWORD="$SRC_DB_PASS" psql \
+        -h "$SRC_DB_HOST" -p "$SRC_DB_PORT" -U "$SRC_DB_USER" \
+        "${test_cmd[@]}" &>/dev/null; then
+      SRC_PG_AUTH_METHOD="password"
+      print_success "PostgreSQL auth: password (from odoo.conf)"
+      return 0
+    fi
+    print_warn "Password from odoo.conf did not work — trying peer auth..."
+  else
+    print_info "No password in odoo.conf — using peer auth (standard for server installs)"
+  fi
+
+  # Method 2: peer auth — run as the Odoo OS user (no password needed)
+  # pg_hba.conf line: "local all all peer" means the OS username = PG username
+  if id "$SRC_DB_USER" &>/dev/null; then
+    if sudo -u "$SRC_DB_USER" psql -U "$SRC_DB_USER" \
+        "${test_cmd[@]}" &>/dev/null; then
+      SRC_PG_AUTH_METHOD="peer_odoo"
+      print_success "PostgreSQL auth: peer auth (sudo -u ${SRC_DB_USER}) — no password needed"
+      return 0
+    fi
+  fi
+
+  # Method 3: peer auth as postgres superuser (always has full access)
+  if sudo -u postgres psql -U postgres \
+      "${test_cmd[@]}" &>/dev/null; then
+    SRC_PG_AUTH_METHOD="peer_postgres"
+    print_success "PostgreSQL auth: peer auth (sudo -u postgres) — no password needed"
+    return 0
+  fi
+
+  # Method 4: manual password — last resort only
+  echo ""
+  echo -e "  ${YELLOW}  Could not connect to PostgreSQL automatically.${NC}"
+  echo -e "  ${GRAY}  Tried: password from config, peer as '${SRC_DB_USER}', peer as 'postgres'${NC}"
+  echo ""
+  read -rsp "  PostgreSQL password for '${SRC_DB_USER}' (Enter to abort): " SRC_DB_PASS; echo ""
+  [[ -z "$SRC_DB_PASS" ]] && { print_error "Cannot connect to PostgreSQL. Aborting."; return 1; }
+
+  if PGPASSWORD="$SRC_DB_PASS" psql \
+      -h "$SRC_DB_HOST" -p "$SRC_DB_PORT" -U "$SRC_DB_USER" \
+      "${test_cmd[@]}" &>/dev/null; then
+    SRC_PG_AUTH_METHOD="password"
+    print_success "PostgreSQL auth: password (manually entered)"
+    return 0
+  fi
+
+  print_error "Still cannot connect to PostgreSQL. Check credentials and try again."
+  return 1
+}
+
 _src_list_dbs_docker() {
   # List databases from inside Docker container (source is Docker-based)
   docker exec -e PGPASSWORD="$SRC_DB_PASS" "$SRC_DOCKER_CONTAINER_DB" \
@@ -376,9 +493,8 @@ _src_list_dbs_docker() {
 }
 
 _src_list_dbs_native() {
-  # List databases from native PostgreSQL (source is server-based)
-  PGPASSWORD="$SRC_DB_PASS" psql \
-    -h "$SRC_DB_HOST" -p "$SRC_DB_PORT" -U "$SRC_DB_USER" -t \
+  # Connect to maintenance DB 'postgres' to list all databases
+  _src_pg psql -d postgres -t \
     -c "SELECT datname FROM pg_database WHERE datistemplate=false AND datname<>'postgres' ORDER BY datname;" \
     2>/dev/null | tr -d ' ' | grep -v '^$'
 }
@@ -446,15 +562,18 @@ setup_source() {
   local found_conf=""
   local proc_conf proc_db_hint
 
-  # Extract config path from Odoo process: looks for -c /path/to/config
-  proc_conf=$(ps aux 2>/dev/null \
-    | grep -v grep \
-    | grep -E 'odoo-bin|odoo\.py|openerp-server|odoo-server' \
-    | grep -oP '(?<=-c\s)\S+' | head -1)
-  [[ -z "$proc_conf" ]] && proc_conf=$(ps aux 2>/dev/null \
-    | grep -v grep \
-    | grep -E 'python.*odoo|python.*openerp' \
-    | grep -oP '(?<=-c\s)\S+' | head -1)
+  # Extract config path AND binary path from the running Odoo process
+  local proc_line
+  proc_line=$(ps aux 2>/dev/null | grep -v grep \
+    | grep -E 'odoo-bin|odoo\.py|openerp-server|odoo-server|python.*odoo|python.*openerp' \
+    | head -1)
+
+  proc_conf=$(echo "$proc_line" | grep -oP '(?<=-c\s)\S+' | head -1)
+
+  # Extract full path to odoo-bin / odoo.py from the process command
+  local proc_bin
+  proc_bin=$(echo "$proc_line" | grep -oP '\S*(?:odoo-bin|odoo\.py|openerp-server)\S*' | head -1)
+  [[ -f "$proc_bin" ]] && SRC_ODOO_BIN="$proc_bin"
 
   # Extract active DB names from PostgreSQL worker processes
   # Format: "postgres: VER/main: USER DBNAME [host] state"
@@ -468,6 +587,8 @@ setup_source() {
     found_conf="$proc_conf"
     echo -e "  ${GREEN}  ✔ Running Odoo process detected${NC}"
     echo -e "  ${GRAY}    Config:    ${found_conf}${NC}"
+    [[ -n "$SRC_ODOO_BIN" ]] && \
+      echo -e "  ${GRAY}    Binary:    ${SRC_ODOO_BIN}${NC}"
     [[ -n "$proc_db_hint" ]] && \
       echo -e "  ${GRAY}    Active DB: ${proc_db_hint}${NC}"
   elif [[ -n "$proc_conf" ]]; then
@@ -645,9 +766,10 @@ setup_source() {
     SRC_DB_USER=$(parse_conf_key "$SRC_ODOO_CONF" "db_user");   SRC_DB_USER=${SRC_DB_USER:-odoo}
     SRC_DB_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "db_password")
     local addons_path; addons_path=$(parse_conf_key "$SRC_ODOO_CONF" "addons_path")
-    [[ -z "$SRC_DB_PASS" ]] && {
-      read -rsp "  PostgreSQL password for '${SRC_DB_USER}': " SRC_DB_PASS; echo ""
-    }
+
+    echo ""
+    print_step "Resolving PostgreSQL connection..."
+    _resolve_src_pg_auth || return 1
 
     print_step "Detecting Odoo version..."
     _src_confirm_version "$(detect_local_version)" || return 1
@@ -676,9 +798,10 @@ setup_source() {
     SRC_DB_USER=$(parse_conf_key "$SRC_ODOO_CONF" "db_user");   SRC_DB_USER=${SRC_DB_USER:-odoo}
     SRC_DB_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "db_password")
     local addons_path; addons_path=$(parse_conf_key "$SRC_ODOO_CONF" "addons_path")
-    [[ -z "$SRC_DB_PASS" ]] && {
-      read -rsp "  PostgreSQL password for '${SRC_DB_USER}': " SRC_DB_PASS; echo ""
-    }
+
+    echo ""
+    print_step "Resolving PostgreSQL connection..."
+    _resolve_src_pg_auth || return 1
 
     print_step "Detecting Odoo version..."
     _src_confirm_version "$(detect_local_version)" || return 1
@@ -1102,12 +1225,10 @@ dump_source_db() {
         -F c --no-owner --no-acl --encoding=UTF8 \
         "$SRC_DB_NAME" > "$BACKUP_FILE"
   else
-    print_info "Source is server Odoo — running pg_dump locally"
-    PGPASSWORD="$SRC_DB_PASS" PGCLIENTENCODING="UTF8" \
-      pg_dump \
-        -h "$SRC_DB_HOST" -p "$SRC_DB_PORT" -U "$SRC_DB_USER" \
-        -F c --no-owner --no-acl --encoding=UTF8 \
-        "$SRC_DB_NAME" > "$BACKUP_FILE"
+    print_info "Source is server Odoo — auth method: ${SRC_PG_AUTH_METHOD}"
+    _src_pg pg_dump \
+      -F c --no-owner --no-acl --encoding=UTF8 \
+      "$SRC_DB_NAME" > "$BACKUP_FILE"
   fi
 
   if [[ ! -s "$BACKUP_FILE" ]]; then
