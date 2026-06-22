@@ -845,8 +845,10 @@ prepare_destination() {
   setup_dst_postgres || return 1
   write_odoo_conf_on_dst || return 1
 
-  # Enable PostgreSQL statement logging so jsonb failures can be detected
+  # Enable verbose PG error logging so DETAIL lines (containing conflicting key names
+  # for UniqueViolation) appear in /var/log/postgresql/*.log for auto-fix parsing.
   dst_sh "sudo -u postgres psql -c \"ALTER SYSTEM SET log_min_error_statement='error';\" 2>/dev/null && \
+          sudo -u postgres psql -c \"ALTER SYSTEM SET log_error_verbosity='verbose';\" 2>/dev/null && \
           sudo -u postgres psql -c \"SELECT pg_reload_conf();\" 2>/dev/null || true" \
     >> "$MIGRATION_LOG" 2>&1 || true
 
@@ -943,7 +945,8 @@ transfer_and_restore_db() {
       addon_out=$(dst_sh \
         "mkdir -p '${DST_ADDONS_DIR}' && \
          tar -xzf /tmp/_odoo_vps_addons.tar.gz -C '${DST_ADDONS_DIR}' 2>&1 && \
-         chown -R odoo:odoo '${DST_ADDONS_DIR}' && \
+         (chown -R odoo:odoo '${DST_ADDONS_DIR}' 2>/dev/null || \
+          chown -R \$(id -u odoo 2>/dev/null || echo 0):\$(id -g odoo 2>/dev/null || echo 0) '${DST_ADDONS_DIR}' 2>/dev/null || true) && \
          rm -f /tmp/_odoo_vps_addons.tar.gz && \
          echo OK" 2>&1 || true)
       echo "$addon_out" >> "$MIGRATION_LOG"
@@ -998,7 +1001,8 @@ transfer_and_restore_db() {
   echo "$restore_out" >> "$MIGRATION_LOG"
   dst_sh "rm -f /tmp/_odoo_vps_migrate.dump" 2>/dev/null || true
 
-  local errs; errs=$(echo "$restore_out" | grep -ci "error" 2>/dev/null || echo 0)
+  local errs=0
+  errs=$(echo "$restore_out" | grep -i "error" 2>/dev/null | wc -l) || errs=0
   [[ ${errs:-0} -gt 0 ]] \
     && print_warn "Restore finished with ${errs} warning(s) — usually harmless" \
     || print_success "Restore completed with zero errors"
@@ -1033,17 +1037,72 @@ ensure_docker_on_dst() {
 pre_hop_sql_patches() {
   local hop_ver=$1 db=$2 prev_ver=$3
   if [[ "$prev_ver" == "14"* ]] && [[ "$hop_ver" == "15.0" ]]; then
-    print_info "Pre-hop patch (14→15): removing conflicting ir_config_parameter rows..."
-    dst_sh "PGPASSWORD='${DST_DB_PASS}' psql -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' -q \
-      -c \"DELETE FROM ir_config_parameter \
-           WHERE key IN ('mail.catchall.alias','mail.catchall.domain');\"" \
-      >> "$MIGRATION_LOG" 2>&1 || true
+    print_info "Pre-hop patch (14→15): cleaning orphan ir_config_parameter rows..."
+    # Write SQL to a local temp file and scp it — avoids complex quoting through SSH layers.
+    # Deletes ALL ir_config_parameter records that have no XML ID in ir_model_data.
+    # Odoo 14 modules create these programmatically; Odoo 15 tries to INSERT them via its
+    # base XML data files, hitting the unique constraint on the key column.
+    # Odoo 15 re-creates them with correct default values on first run.
+    local sql_f; sql_f=$(mktemp /tmp/pre_hop_XXXXXX.sql)
+    cat > "$sql_f" <<'EOSQL'
+DELETE FROM ir_config_parameter
+WHERE id NOT IN (
+    SELECT res_id
+    FROM   ir_model_data
+    WHERE  model     = 'ir.config_parameter'
+    AND    res_id IS NOT NULL
+);
+EOSQL
+    dst_scp "$sql_f" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_pre_hop_patch.sql" 2>/dev/null
+    rm -f "$sql_f"
+    dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
+      -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
+      -f /tmp/_pre_hop_patch.sql 2>&1 && \
+      rm -f /tmp/_pre_hop_patch.sql" >> "$MIGRATION_LOG" 2>&1 || true
     print_success "Pre-hop patch applied"
   fi
 }
 
+# Delete a single conflicting ir_config_parameter key from PG logs, or fall back
+# to the broad orphan-DELETE if the log line can't be parsed.
+_fix_icp_conflict() {
+  local db=$1
+  local conf_key
+  conf_key=$(dst_sh \
+    "find /var/log/postgresql -name '*.log' 2>/dev/null | \
+     xargs grep -h 'Key (key)=' 2>/dev/null | tail -1 | \
+     grep -oP '(?<=Key \(key\)=\()[^)]+'" 2>/dev/null | tr -d '[:space:]' || echo "")
+
+  if [[ -n "$conf_key" ]]; then
+    printf "  ${YELLOW}⚠  ir_config_parameter conflict: deleting key '%s'${NC}\n" "$conf_key"
+    log_msg "Deleting conflicting ir_config_parameter key: ${conf_key}"
+    dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
+      -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
+      -c \"DELETE FROM ir_config_parameter WHERE key = '${conf_key}';\"" \
+      >> "$MIGRATION_LOG" 2>&1 || true
+  else
+    print_warn "Cannot read key from PG log — running broad orphan cleanup..."
+    local sql_f; sql_f=$(mktemp /tmp/fix_icp_XXXXXX.sql)
+    cat > "$sql_f" <<'EOSQL'
+DELETE FROM ir_config_parameter
+WHERE id NOT IN (
+    SELECT res_id
+    FROM   ir_model_data
+    WHERE  model     = 'ir.config_parameter'
+    AND    res_id IS NOT NULL
+);
+EOSQL
+    dst_scp "$sql_f" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_fix_icp.sql" 2>/dev/null
+    rm -f "$sql_f"
+    dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
+      -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
+      -f /tmp/_fix_icp.sql 2>&1 && rm -f /tmp/_fix_icp.sql" \
+      >> "$MIGRATION_LOG" 2>&1 || true
+  fi
+}
+
 run_one_hop() {
-  local hop_ver=$1 db=$2
+  local hop_ver=$1 db=$2 rollback_file=${3:-}
 
   local ou_img="${OPENUPGRADE_IMG}:${hop_ver}"
   local std_img="odoo:${hop_ver}"
@@ -1067,43 +1126,90 @@ run_one_hop() {
   fi
   echo -e "  ${CYAN}ℹ  Image: ${use_img}${NC}"
 
-  print_step "Running upgrade to ${hop_ver} (may take 10–40 minutes)..."
+  # Auto-retry loop — handles UniqueViolation on ir_config_parameter by:
+  # 1. Restoring the pre-hop rollback dump
+  # 2. Deleting the specific conflicting key (parsed from PG logs)
+  # 3. Retrying the hop
+  local max_icp_retries=8 icp_retry=0
 
-  local hop_out
-  hop_out=$(dst_sh "docker run --rm \
-    --network=host \
-    -e HOST=127.0.0.1 \
-    -e USER='${DST_DB_USER}' \
-    -e PASSWORD='${DST_DB_PASS}' \
-    -v '${DST_ADDONS_DIR}:/mnt/extra-addons' \
-    '${use_img}' \
-    odoo --update=all --stop-after-init \
-      --db_host=127.0.0.1 \
-      --db_user='${DST_DB_USER}' \
-      --db_password='${DST_DB_PASS}' \
-      --database='${db}' \
-      --no-http 2>&1" || true)
-  echo "$hop_out" >> "$MIGRATION_LOG"
+  while [[ $icp_retry -le $max_icp_retries ]]; do
+    if [[ $icp_retry -gt 0 ]]; then
+      printf "  ${CYAN}ℹ  Retry %d/%d after ir_config_parameter fix...${NC}\n" \
+        "$icp_retry" "$max_icp_retries"
+    else
+      print_step "Running upgrade to ${hop_ver} (may take 10–40 minutes)..."
+    fi
 
-  local errors; errors=$(echo "$hop_out" | grep -c " ERROR \| CRITICAL " 2>/dev/null || echo 0)
+    local hop_out
+    hop_out=$(dst_sh "docker run --rm \
+      --network=host \
+      -e HOST=127.0.0.1 \
+      -e USER='${DST_DB_USER}' \
+      -e PASSWORD='${DST_DB_PASS}' \
+      -v '${DST_ADDONS_DIR}:/mnt/extra-addons' \
+      '${use_img}' \
+      odoo --update=all --stop-after-init \
+        --db_host=127.0.0.1 \
+        --db_user='${DST_DB_USER}' \
+        --db_password='${DST_DB_PASS}' \
+        --database='${db}' \
+        --no-http 2>&1" || true)
+    echo "$hop_out" >> "$MIGRATION_LOG"
 
-  if echo "$hop_out" | grep -qiE "shutdown complete|modules loaded"; then
-    print_success "Hop to ${hop_ver} complete"
-    [[ ${errors:-0} -gt 0 ]] && print_warn "${errors} non-critical error(s) logged"
+    local errors=0
+    errors=$(echo "$hop_out" | grep -c " ERROR \| CRITICAL " 2>/dev/null) || errors=0
+
+    # ── Success ───────────────────────────────────────────────────
+    if echo "$hop_out" | grep -qiE "shutdown complete|modules loaded"; then
+      print_success "Hop to ${hop_ver} complete"
+      [[ ${errors:-0} -gt 0 ]] && print_warn "${errors} non-critical error(s) logged"
+      return 0
+    fi
+
+    # ── UniqueViolation on ir_config_parameter — auto-fix and retry ──
+    if echo "$hop_out" | grep -q "ir_config_parameter_key_uniq"; then
+      if [[ $icp_retry -ge $max_icp_retries ]]; then
+        print_error "Reached ${max_icp_retries} ir_config_parameter auto-fix attempts"
+        break
+      fi
+      # Restore rollback so the DB is clean before the fix + retry
+      if [[ -n "$rollback_file" ]]; then
+        dst_sh "test -s '${rollback_file}'" 2>/dev/null && {
+          print_info "Restoring rollback for clean retry..."
+          dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
+            -h 127.0.0.1 -U '${DST_DB_USER}' -d postgres \
+            -c 'DROP DATABASE IF EXISTS \"${db}\";' 2>&1 && \
+            PGPASSWORD='${DST_DB_PASS}' psql \
+            -h 127.0.0.1 -U '${DST_DB_USER}' -d postgres \
+            -c 'CREATE DATABASE \"${db}\" TEMPLATE template0 ENCODING UTF8 OWNER \"${DST_DB_USER}\";' 2>&1 && \
+            PGPASSWORD='${DST_DB_PASS}' pg_restore \
+            -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
+            --no-owner --no-acl -Fc '${rollback_file}' 2>&1" \
+            >> "$MIGRATION_LOG" 2>&1 || true
+          print_success "Rollback restored"
+        }
+      fi
+      _fix_icp_conflict "$db"
+      ((icp_retry++))
+      continue
+    fi
+
+    # ── Other critical failure ────────────────────────────────────
+    if echo "$hop_out" | grep -qiE "CRITICAL|Failed to initialize"; then
+      print_error "Hop to ${hop_ver} FAILED"
+      echo "$hop_out" | grep -iE "ERROR|CRITICAL" | tail -6 | \
+        while IFS= read -r l; do echo -e "  ${RED}  ${l}${NC}"; done
+      echo "=== HOP FAILED: ${hop_ver} ===" >> "$ERR_LOG"
+      echo "$hop_out" >> "$ERR_LOG"
+      confirm "Continue to next hop anyway?" && return 0 || return 1
+    fi
+
+    print_warn "Hop to ${hop_ver} — unclear result, proceeding"
     return 0
-  fi
+  done
 
-  if echo "$hop_out" | grep -qiE "CRITICAL|Failed to initialize"; then
-    print_error "Hop to ${hop_ver} FAILED"
-    echo "$hop_out" | grep -iE "ERROR|CRITICAL" | tail -6 | \
-      while IFS= read -r l; do echo -e "  ${RED}  ${l}${NC}"; done
-    echo "=== HOP FAILED: ${hop_ver} ===" >> "$ERR_LOG"
-    echo "$hop_out" >> "$ERR_LOG"
-    confirm "Continue to next hop anyway?" && return 0 || return 1
-  fi
-
-  print_warn "Hop to ${hop_ver} — unclear result, proceeding"
-  return 0
+  print_error "Hop to ${hop_ver} failed after all retry attempts"
+  confirm "Continue to next hop anyway?" && return 0 || return 1
 }
 
 run_all_hops() {
@@ -1138,7 +1244,7 @@ run_all_hops() {
       || print_warn "Rollback save failed"
 
     pre_hop_sql_patches "$hop_ver" "$db" "$prev_ver"
-    run_one_hop "$hop_ver" "$db" || return 1
+    run_one_hop "$hop_ver" "$db" "$hop_bk" || return 1
 
     prev_ver="$hop_ver"
     ((current++))
