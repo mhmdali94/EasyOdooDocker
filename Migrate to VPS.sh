@@ -62,6 +62,7 @@ SRC_PG_AUTH_METHOD=""
 SRC_IS_DOCKER="false"
 SRC_DOCKER_CONTAINER_DB=""
 SRC_ADDONS_PATHS=()
+SRC_DATA_DIR="/var/lib/odoo"
 
 # Destination VPS
 DST_SSH_USER="root"
@@ -87,6 +88,7 @@ ERR_LOG="/dev/null"
 HOP_LIST=()
 BACKUP_FILE=""
 ADDONS_BACKUP=""
+FILESTORE_BACKUP=""
 
 # ── SSH helpers ────────────────────────────────────────────────────────────────
 dst_sh() {
@@ -448,6 +450,8 @@ setup_source() {
     SRC_DB_USER=$(parse_conf_key "$SRC_ODOO_CONF" "db_user");   SRC_DB_USER=${SRC_DB_USER:-odoo}
     SRC_DB_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "db_password")
     SRC_MASTER_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "admin_passwd")
+    local _dd; _dd=$(parse_conf_key "$SRC_ODOO_CONF" "data_dir")
+    SRC_DATA_DIR="${_dd:-/var/lib/odoo}"
     local addons_raw; addons_raw=$(parse_conf_key "$SRC_ODOO_CONF" "addons_path")
     _ask_master_password
     echo ""
@@ -475,6 +479,8 @@ setup_source() {
     SRC_DB_USER=$(parse_conf_key "$SRC_ODOO_CONF" "db_user");   SRC_DB_USER=${SRC_DB_USER:-odoo}
     SRC_DB_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "db_password")
     SRC_MASTER_PASS=$(parse_conf_key "$SRC_ODOO_CONF" "admin_passwd")
+    local _dd2; _dd2=$(parse_conf_key "$SRC_ODOO_CONF" "data_dir")
+    SRC_DATA_DIR="${_dd2:-/var/lib/odoo}"
     local addons_raw; addons_raw=$(parse_conf_key "$SRC_ODOO_CONF" "addons_path")
     _ask_master_password
     echo ""
@@ -868,6 +874,7 @@ dump_source_db() {
   local ts; ts=$(date +%Y%m%d_%H%M%S)
   BACKUP_FILE="${LOCAL_BACKUP_DIR}/${SRC_DB_NAME}_v${SRC_VERSION}_${ts}.dump"
   ADDONS_BACKUP="${LOCAL_BACKUP_DIR}/${SRC_DB_NAME}_addons_${ts}.tar.gz"
+  FILESTORE_BACKUP="${LOCAL_BACKUP_DIR}/${SRC_DB_NAME}_filestore_${ts}.tar.gz"
   mkdir -p "$LOCAL_BACKUP_DIR"
 
   print_step "Dumping '${SRC_DB_NAME}' (binary / UTF-8, read-only on source)..."
@@ -918,6 +925,19 @@ dump_source_db() {
   else
     ADDONS_BACKUP=""
   fi
+
+  # Archive filestore (read-only on source — just tar, no modification)
+  local fs_path="${SRC_DATA_DIR}/filestore/${SRC_DB_NAME}"
+  if [[ -d "$fs_path" ]]; then
+    local fs_sz; fs_sz=$(du -sh "$fs_path" 2>/dev/null | cut -f1)
+    print_step "Archiving filestore (${fs_sz}): ${fs_path}"
+    tar -czf "$FILESTORE_BACKUP" -C "${SRC_DATA_DIR}/filestore" "$SRC_DB_NAME" 2>/dev/null \
+      && print_success "Filestore archived: ${FILESTORE_BACKUP}" \
+      || { print_warn "Filestore archive had warnings (attachments may be incomplete)"; FILESTORE_BACKUP=""; }
+  else
+    print_warn "Filestore not found at ${fs_path} — attachments will be missing on destination"
+    FILESTORE_BACKUP=""
+  fi
 }
 
 # ══════════════════════════════════════════════════════════════
@@ -956,6 +976,28 @@ transfer_and_restore_db() {
              echo "$addon_out" | tail -5 | while IFS= read -r l; do echo -e "  ${GRAY}  $l${NC}"; done; }
     else
       print_warn "Addons file transfer failed — continuing without custom addons"
+    fi
+  fi
+
+  # Transfer filestore
+  if [[ -n "$FILESTORE_BACKUP" && -f "$FILESTORE_BACKUP" ]]; then
+    local fs_sz; fs_sz=$(du -sh "$FILESTORE_BACKUP" | cut -f1)
+    print_step "Transferring filestore (${fs_sz})..."
+    if dst_scp "$FILESTORE_BACKUP" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_odoo_vps_filestore.tar.gz"; then
+      local fs_out
+      fs_out=$(dst_sh \
+        "mkdir -p /var/lib/odoo/filestore && \
+         tar -xzf /tmp/_odoo_vps_filestore.tar.gz -C /var/lib/odoo/filestore/ 2>&1 && \
+         (chown -R odoo:odoo /var/lib/odoo/filestore/ 2>/dev/null || \
+          chown -R \$(id -u odoo 2>/dev/null || echo 0):\$(id -g odoo 2>/dev/null || echo 0) \
+            /var/lib/odoo/filestore/ 2>/dev/null || true) && \
+         rm -f /tmp/_odoo_vps_filestore.tar.gz && echo OK" 2>&1 || true)
+      echo "$fs_out" >> "$MIGRATION_LOG"
+      echo "$fs_out" | grep -q "^OK$" \
+        && print_success "Filestore deployed to /var/lib/odoo/filestore/" \
+        || print_warn "Filestore deployment had warnings — attachments may be incomplete"
+    else
+      print_warn "Filestore transfer failed — attachments will be missing"
     fi
   fi
 
@@ -1036,11 +1078,44 @@ ensure_docker_on_dst() {
 
 pre_hop_sql_patches() {
   local hop_ver=$1 db=$2 prev_ver=$3
+
   if [[ "$prev_ver" == "14"* ]] && [[ "$hop_ver" == "15.0" ]]; then
     print_info "Pre-hop patch (14→15): cleaning ir_config_parameter conflicts..."
     _icp_clean_for_hop "$db"
-    print_success "Pre-hop patch applied"
+    print_success "Pre-hop patch applied (14→15)"
   fi
+
+  if [[ "$prev_ver" == "17"* ]] && [[ "$hop_ver" == "18.0" ]]; then
+    print_info "Pre-hop patch (17→18): deduplicating res_lang..."
+    _reslang_clean_for_hop "$db"
+    print_success "Pre-hop patch applied (17→18)"
+  fi
+}
+
+# Deduplicate res_lang by name and code (keeps lowest id).
+# Odoo 18 enforces res_lang_name_uniq and res_lang_code_uniq; duplicate rows
+# accumulated across 15/16/17 hops cause UniqueViolation on the 18 upgrade.
+_reslang_clean_for_hop() {
+  local db=$1
+  local sql_f; sql_f=$(mktemp /tmp/reslang_clean_XXXXXX.sql)
+  cat > "$sql_f" <<'EOSQL'
+-- Deduplicate by name (keep lowest id per name)
+DELETE FROM res_lang
+WHERE id NOT IN (
+    SELECT MIN(id) FROM res_lang GROUP BY name
+);
+-- Deduplicate by code (keep lowest id per code)
+DELETE FROM res_lang
+WHERE id NOT IN (
+    SELECT MIN(id) FROM res_lang GROUP BY code
+);
+EOSQL
+  dst_scp "$sql_f" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_reslang_clean.sql" 2>/dev/null
+  rm -f "$sql_f"
+  dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
+    -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
+    -f /tmp/_reslang_clean.sql 2>&1 && rm -f /tmp/_reslang_clean.sql" \
+    >> "$MIGRATION_LOG" 2>&1 || true
 }
 
 # Full ir_config_parameter cleanup before a hop attempt.
@@ -1146,6 +1221,35 @@ run_one_hop() {
       print_success "Hop to ${hop_ver} complete"
       [[ ${errors:-0} -gt 0 ]] && print_warn "${errors} non-critical error(s) logged"
       return 0
+    fi
+
+    # ── UniqueViolation on res_lang ───────────────────────────────
+    if echo "$hop_out" | grep -qE "res_lang_name_uniq|res_lang_code_uniq"; then
+      if [[ $icp_retry -ge $max_icp_retries ]]; then
+        print_error "Reached ${max_icp_retries} res_lang auto-fix attempts"
+        break
+      fi
+      print_warn "res_lang unique constraint — deduplicating and retrying..."
+      log_msg "res_lang UniqueViolation — restoring rollback and deduplicating"
+      if [[ -n "$rollback_file" ]]; then
+        dst_sh "test -s '${rollback_file}'" 2>/dev/null && {
+          print_info "Restoring rollback for clean retry..."
+          dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
+            -h 127.0.0.1 -U '${DST_DB_USER}' -d postgres \
+            -c 'DROP DATABASE IF EXISTS \"${db}\";' 2>&1 && \
+            PGPASSWORD='${DST_DB_PASS}' psql \
+            -h 127.0.0.1 -U '${DST_DB_USER}' -d postgres \
+            -c 'CREATE DATABASE \"${db}\" TEMPLATE template0 ENCODING UTF8 OWNER \"${DST_DB_USER}\";' 2>&1 && \
+            PGPASSWORD='${DST_DB_PASS}' pg_restore \
+            -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
+            --no-owner --no-acl -Fc '${rollback_file}' 2>&1" \
+            >> "$MIGRATION_LOG" 2>&1 || true
+          print_success "Rollback restored"
+        }
+      fi
+      _reslang_clean_for_hop "$db"
+      ((icp_retry++))
+      continue
     fi
 
     # ── UniqueViolation on ir_config_parameter ────────────────────
