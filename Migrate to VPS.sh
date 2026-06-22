@@ -179,6 +179,42 @@ parse_odoo_conf() {
   [[ -z "$SRC_DB_USER"  || "$SRC_DB_USER"  == "False" ]] && SRC_DB_USER="odoo"
 }
 
+# ── Source: find odoo.conf (local) ────────────────────────────────────────────
+find_odoo_conf_local() {
+  # 1. Fixed well-known paths
+  local candidates=(
+    /etc/odoo/odoo.conf
+    /etc/odoo.conf
+    /opt/odoo/odoo.conf
+    /opt/odoo/server/odoo.conf
+    /opt/odoo14/odoo.conf
+    /opt/odoo15/odoo.conf
+    /opt/odoo16/odoo.conf
+    /opt/odoo17/odoo.conf
+    /opt/odoo18/odoo.conf
+    /home/odoo/odoo.conf
+    /home/odoo/.odoorc
+    /root/odoo.conf
+  )
+  for p in "${candidates[@]}"; do
+    [[ -f "$p" ]] && { echo "$p"; return 0; }
+  done
+
+  # 2. Check the running Odoo process for the -c / --config flag
+  local proc_conf
+  proc_conf=$(ps aux 2>/dev/null | grep -E '[o]doo.*\.conf' \
+    | grep -oP '(?<=-c\s|--config[= ])[^ ]+' | head -1)
+  [[ -f "$proc_conf" ]] && { echo "$proc_conf"; return 0; }
+
+  # 3. Scan common install roots (fast, depth-limited)
+  local found
+  found=$(find /etc /opt /home /root /srv /var/lib/odoo \
+    -maxdepth 5 -name 'odoo.conf' 2>/dev/null | head -1)
+  [[ -f "$found" ]] && { echo "$found"; return 0; }
+
+  return 1
+}
+
 # ── Source: local server ───────────────────────────────────────────────────────
 setup_source_local() {
   echo ""
@@ -187,45 +223,50 @@ setup_source_local() {
   print_line
   echo ""
 
-  local found=""
-  for p in /etc/odoo/odoo.conf /etc/odoo.conf /opt/odoo/odoo.conf; do
-    [[ -f "$p" ]] && { found="$p"; break; }
-  done
+  print_step "Auto-detecting Odoo config file..."
+  local found
+  found=$(find_odoo_conf_local 2>/dev/null || true)
 
-  if [[ -n "$found" ]]; then
-    print_success "Auto-detected config: ${found}"
-    read -rp "  Use this config? [Y/n]: " _yn
-    [[ "${_yn:-Y}" =~ ^[Yy]$ ]] && SRC_ODOO_CONF="$found" || {
-      read -rp "  Config path: " SRC_ODOO_CONF
-    }
+  if [[ -f "$found" ]]; then
+    print_success "Config: ${found}"
+    SRC_ODOO_CONF="$found"
   else
+    print_warn "Could not auto-detect odoo.conf"
     read -rp "  Path to odoo.conf: " SRC_ODOO_CONF
+    [[ ! -f "$SRC_ODOO_CONF" ]] && { print_error "File not found: ${SRC_ODOO_CONF}"; return 1; }
   fi
-  [[ ! -f "$SRC_ODOO_CONF" ]] && { print_error "File not found: ${SRC_ODOO_CONF}"; return 1; }
 
   parse_odoo_conf "$SRC_ODOO_CONF"
 
-  # Detect version
+  # Detect version — no confirmation prompt, just use what we find
   local auto_ver=""
   for f in /usr/lib/python3/dist-packages/odoo/release.py \
-            /usr/local/lib/python*/dist-packages/odoo/release.py \
-            /opt/odoo/odoo/release.py; do
-    [[ -f "$f" ]] && auto_ver=$(grep -oP "version = '\K\d+\.\d+" "$f" 2>/dev/null | head -1) && break
+            /usr/local/lib/python3*/dist-packages/odoo/release.py \
+            /opt/odoo/odoo/release.py /opt/odoo14/odoo/release.py \
+            /opt/odoo/server/odoo/release.py; do
+    [[ -f "$f" ]] && {
+      auto_ver=$(grep -oP "version = '\K\d+\.\d+" "$f" 2>/dev/null | head -1)
+      [[ -n "$auto_ver" ]] && break
+    }
   done
-  [[ -z "$auto_ver" ]] && auto_ver=$(python3 -c "import odoo; print(odoo.release.version)" 2>/dev/null | grep -oP '\d+\.\d+' | head -1 || true)
+  [[ -z "$auto_ver" ]] && \
+    auto_ver=$(find /usr /opt -name 'release.py' -path '*/odoo/*' 2>/dev/null \
+      | head -3 | xargs grep -hoP "version = '\K\d+\.\d+" 2>/dev/null | head -1 || true)
+  [[ -z "$auto_ver" ]] && \
+    auto_ver=$(python3 -c "import odoo; print(odoo.release.version)" 2>/dev/null \
+               | grep -oP '\d+\.\d+' | head -1 || true)
 
   if [[ -n "$auto_ver" ]]; then
-    print_success "Detected version: ${auto_ver}"
-    read -rp "  Confirm version [${auto_ver}]: " inp
-    SRC_VERSION="${inp:-$auto_ver}"
+    print_success "Version: ${auto_ver}"
+    SRC_VERSION="$auto_ver"
   else
-    read -rp "  Odoo version (e.g. 14.0): " SRC_VERSION
+    read -rp "  Could not detect version. Enter it (e.g. 14.0): " SRC_VERSION
   fi
 
   local maj; maj=$(version_major "$SRC_VERSION")
   [[ $maj -lt 14 || $maj -ge 19 ]] && { print_error "Must be v14–v18"; return 1; }
 
-  # List databases
+  # List databases — auto-select if only one exists
   local dbs=()
   local raw_dbs
   raw_dbs=$(sudo -u odoo psql -tAc \
@@ -238,19 +279,24 @@ setup_source_local() {
      AND datname NOT IN ('postgres','template0','template1') ORDER BY datname;" \
     2>/dev/null) || true
 
-  if [[ -n "$raw_dbs" ]]; then
+  while IFS= read -r db; do
+    [[ -n "$db" ]] && dbs+=("$db")
+  done <<< "$raw_dbs"
+
+  if [[ ${#dbs[@]} -eq 1 ]]; then
+    SRC_DB_NAME="${dbs[0]}"
+    print_success "Database: ${SRC_DB_NAME} (only one found — auto-selected)"
+  elif [[ ${#dbs[@]} -gt 1 ]]; then
     echo ""
     echo -e "  ${GRAY}  Available databases:${NC}"
-    local i=1
-    while IFS= read -r db; do
-      echo -e "    ${CYAN}${i})${NC} ${db}"
-      dbs+=("$db"); ((i++))
-    done <<< "$raw_dbs"
+    for i in "${!dbs[@]}"; do
+      echo -e "    ${CYAN}$((i+1)))${NC} ${dbs[$i]}"
+    done
     echo ""
     read -rp "  Choose database [1]: " ch; ch="${ch:-1}"
     SRC_DB_NAME="${dbs[$((ch-1))]}"
   else
-    read -rp "  Enter database name: " SRC_DB_NAME
+    read -rp "  Could not list databases. Enter name: " SRC_DB_NAME
   fi
 
   [[ -z "$SRC_DB_NAME" ]] && { print_error "No database selected"; return 1; }
@@ -282,14 +328,28 @@ setup_source_remote() {
     || { print_error "SSH to source failed"; return 1; }
   print_success "Connected to source"
 
-  # Detect config
+  # Detect config — check known paths, then running process, then find
+  print_step "Auto-detecting Odoo config on source..."
   SRC_ODOO_CONF=""
-  for p in /etc/odoo/odoo.conf /etc/odoo.conf /opt/odoo/odoo.conf; do
-    if src_sh "test -f '$p'" 2>/dev/null; then
-      SRC_ODOO_CONF="$p"; print_success "Found config: ${p}"; break
-    fi
-  done
-  if [[ -z "$SRC_ODOO_CONF" ]]; then
+  local _found_remote
+  _found_remote=$(src_sh "
+    for p in /etc/odoo/odoo.conf /etc/odoo.conf /opt/odoo/odoo.conf \
+              /opt/odoo14/odoo.conf /opt/odoo15/odoo.conf /opt/odoo16/odoo.conf \
+              /opt/odoo17/odoo.conf /opt/odoo18/odoo.conf \
+              /home/odoo/odoo.conf /root/odoo.conf; do
+      [ -f \"\$p\" ] && echo \"\$p\" && break
+    done
+    # check running process
+    ps aux 2>/dev/null | grep -E '[o]doo.*\.conf' | grep -oP '(?<=-c )[^ ]+' | head -1
+    # last resort: find
+    find /etc /opt /home /root -maxdepth 5 -name 'odoo.conf' 2>/dev/null | head -1
+  " 2>/dev/null | grep -v '^$' | head -1 | tr -d '[:space:]' || true)
+
+  if [[ -n "$_found_remote" ]]; then
+    SRC_ODOO_CONF="$_found_remote"
+    print_success "Found config: ${SRC_ODOO_CONF}"
+  else
+    print_warn "Could not auto-detect config on source"
     read -rp "  Config path on source: " SRC_ODOO_CONF
   fi
 
@@ -301,22 +361,30 @@ setup_source_remote() {
 
   # Detect version on source
   local auto_ver
-  auto_ver=$(src_sh \
-    "grep -oP \"version = '\\K\\d+\\.\\d+\" /usr/lib/python3/dist-packages/odoo/release.py 2>/dev/null | head -1 || \
-     python3 -c 'import odoo; print(odoo.release.version)' 2>/dev/null | grep -oP '\\d+\\.\\d+' | head -1" \
-    2>/dev/null || true)
+  auto_ver=$(src_sh "
+    # Try release.py in common install paths
+    for f in /usr/lib/python3/dist-packages/odoo/release.py \
+              /usr/local/lib/python3*/dist-packages/odoo/release.py \
+              /opt/odoo/odoo/release.py /opt/odoo14/odoo/release.py; do
+      [ -f \"\$f\" ] && grep -oP \"version = '\\K\\d+\\.\\d+\" \"\$f\" 2>/dev/null | head -1 && break
+    done
+    # Fallback: find any release.py
+    find /usr /opt -name 'release.py' -path '*/odoo/*' 2>/dev/null | head -1 | xargs grep -oP \"version = '\\K\\d+\\.\\d+\" 2>/dev/null | head -1
+    # Last resort: python import
+    python3 -c 'import odoo; print(odoo.release.version)' 2>/dev/null | grep -oP '\\d+\\.\\d+' | head -1
+  " 2>/dev/null | grep -P '^\d+\.\d+$' | head -1 || true)
 
   if [[ -n "$auto_ver" ]]; then
-    print_success "Detected version: ${auto_ver}"
-    read -rp "  Confirm version [${auto_ver}]: " inp; SRC_VERSION="${inp:-$auto_ver}"
+    print_success "Version: ${auto_ver}"
+    SRC_VERSION="$auto_ver"
   else
-    read -rp "  Odoo version on source (e.g. 14.0): " SRC_VERSION
+    read -rp "  Could not detect version. Enter it (e.g. 14.0): " SRC_VERSION
   fi
 
   local maj; maj=$(version_major "$SRC_VERSION")
   [[ $maj -lt 14 || $maj -ge 19 ]] && { print_error "Must be v14–v18"; return 1; }
 
-  # List databases
+  # List databases — auto-select if only one
   local dbs=()
   local raw_dbs
   raw_dbs=$(src_sh \
@@ -328,19 +396,24 @@ setup_source_remote() {
      WHERE datistemplate=false AND datname NOT IN ('postgres','template0','template1') \
      ORDER BY datname;\" 2>/dev/null" || true)
 
-  if [[ -n "$raw_dbs" ]]; then
+  while IFS= read -r db; do
+    [[ -n "$db" ]] && dbs+=("$db")
+  done <<< "$raw_dbs"
+
+  if [[ ${#dbs[@]} -eq 1 ]]; then
+    SRC_DB_NAME="${dbs[0]}"
+    print_success "Database: ${SRC_DB_NAME} (auto-selected)"
+  elif [[ ${#dbs[@]} -gt 1 ]]; then
     echo ""
     echo -e "  ${GRAY}  Available databases:${NC}"
-    local i=1
-    while IFS= read -r db; do
-      echo -e "    ${CYAN}${i})${NC} ${db}"
-      dbs+=("$db"); ((i++))
-    done <<< "$raw_dbs"
+    for i in "${!dbs[@]}"; do
+      echo -e "    ${CYAN}$((i+1)))${NC} ${dbs[$i]}"
+    done
     echo ""
     read -rp "  Choose database [1]: " ch; ch="${ch:-1}"
     SRC_DB_NAME="${dbs[$((ch-1))]}"
   else
-    read -rp "  Enter database name: " SRC_DB_NAME
+    read -rp "  Could not list databases. Enter name: " SRC_DB_NAME
   fi
 
   [[ -z "$SRC_DB_NAME" ]] && { print_error "No database selected"; return 1; }
@@ -686,18 +759,16 @@ dump_source_db() {
       ;;
 
     remote_server)
-      local remote_tmp="/tmp/${SRC_DB_NAME}_mig_$$.dump"
-      print_step "Dumping on remote source..."
+      # Pipe pg_dump directly from source through SSH to local file — no temp file written on source
+      print_step "Dumping from remote source (piping directly — source is read-only)..."
       src_sh "sudo -u odoo pg_dump -Fc --encoding=UTF8 --no-owner --no-acl \
-                '${SRC_DB_NAME}' > '${remote_tmp}' 2>/dev/null || \
-              PGPASSWORD='${SRC_DB_PASS}' pg_dump -h '${SRC_DB_HOST}' -p '${SRC_DB_PORT}' \
+                '${SRC_DB_NAME}' 2>/dev/null || \
+              PGPASSWORD='${SRC_DB_PASS}' pg_dump \
+                -h '${SRC_DB_HOST}' -p '${SRC_DB_PORT}' \
                 -U '${SRC_DB_USER}' -Fc --encoding=UTF8 --no-owner --no-acl \
-                '${SRC_DB_NAME}' > '${remote_tmp}'" \
-        || { print_error "Remote dump failed"; return 1; }
-      print_step "Transferring dump from source..."
-      src_scp "${SRC_SSH_USER}@${SRC_SSH_HOST}:${remote_tmp}" "$BACKUP_FILE" \
-        || { print_error "Transfer from source failed"; return 1; }
-      src_sh "rm -f '${remote_tmp}'" 2>/dev/null || true
+                '${SRC_DB_NAME}'" \
+        > "$BACKUP_FILE" \
+        || { print_error "Remote dump failed"; rm -f "$BACKUP_FILE"; return 1; }
       ;;
 
     docker)
