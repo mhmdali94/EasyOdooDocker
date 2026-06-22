@@ -644,29 +644,83 @@ install_prerequisites() {
 
 install_odoo19() {
   print_step "Checking for Odoo 19..."
-  if dst_sh "command -v odoo > /dev/null 2>&1 && odoo --version 2>/dev/null | grep -q '19'"; then
-    print_success "Odoo 19 already installed"
+  local _existing_ver
+  _existing_ver=$(dst_sh \
+    "/usr/bin/odoo --version 2>/dev/null || odoo --version 2>/dev/null || echo ''" \
+    2>/dev/null | grep -oP '\d+\.\d+' | head -1 || echo "")
+  if [[ "$_existing_ver" == "19"* ]]; then
+    print_success "Odoo 19 already installed (${_existing_ver})"
     return 0
   fi
 
   print_step "Downloading Odoo 19 Community deb package..."
   local url="https://nightly.odoo.com/19.0/nightly/deb/odoo_19.0.latest_all.deb"
-  dst_sh "wget -q '${url}' -O /tmp/odoo19.deb 2>&1" >> "$MIGRATION_LOG" 2>&1
-  dst_sh "test -s /tmp/odoo19.deb" 2>/dev/null \
-    || { print_error "Download failed — check internet on VPS. URL: ${url}"; return 1; }
+  local dl_out
+  dl_out=$(dst_sh "wget '${url}' -O /tmp/odoo19.deb --progress=dot:mega 2>&1" 2>&1 || true)
+  echo "$dl_out" >> "$MIGRATION_LOG"
+  dst_sh "test -s /tmp/odoo19.deb" 2>/dev/null || {
+    print_error "Download failed — check internet on VPS"
+    print_info "URL: ${url}"
+    echo "$dl_out" | tail -5 | while IFS= read -r l; do echo -e "  ${GRAY}  $l${NC}"; done
+    return 1
+  }
+  local sz; sz=$(dst_sh "du -sh /tmp/odoo19.deb 2>/dev/null | cut -f1" | tr -d '[:space:]' || echo "?")
+  print_success "Downloaded (${sz})"
 
   print_step "Installing Odoo 19 (may take a few minutes)..."
-  dst_sh "DEBIAN_FRONTEND=noninteractive apt-get install -y /tmp/odoo19.deb 2>&1" \
-    >> "$MIGRATION_LOG" 2>&1 || {
-    dst_sh "DEBIAN_FRONTEND=noninteractive dpkg -i /tmp/odoo19.deb 2>&1; \
-            apt-get -f install -y -qq 2>&1" >> "$MIGRATION_LOG" 2>&1 \
-      || { print_error "Odoo 19 installation failed — see ${MIGRATION_LOG}"; return 1; }
-  }
+  # Step 1: try apt-get install which auto-resolves dependencies
+  local inst_out
+  inst_out=$(dst_sh \
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-broken /tmp/odoo19.deb 2>&1" \
+    2>&1 || true)
+  echo "$inst_out" >> "$MIGRATION_LOG"
+
+  # If apt-get didn't work (no "Setting up odoo" in output), fall back to dpkg + apt-get -f
+  if ! echo "$inst_out" | grep -qiE "Setting up odoo|is already the newest version"; then
+    print_info "apt-get path did not complete — trying dpkg + apt-get -f install..."
+    local fix_out
+    fix_out=$(dst_sh \
+      "DEBIAN_FRONTEND=noninteractive dpkg -i --force-confdef --force-confold /tmp/odoo19.deb 2>&1; \
+       DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq 2>&1" 2>&1 || true)
+    echo "$fix_out" >> "$MIGRATION_LOG"
+    if echo "$fix_out" | grep -qiE "dpkg: error|Errors were encountered"; then
+      print_error "dpkg install failed:"
+      echo "$fix_out" | grep -iE "dpkg: error|Errors were" | tail -5 | \
+        while IFS= read -r l; do echo -e "  ${RED}  $l${NC}"; done
+      print_info "Full log: ${MIGRATION_LOG}"
+      return 1
+    fi
+  fi
+
   dst_sh "rm -f /tmp/odoo19.deb" 2>/dev/null || true
 
-  local ver; ver=$(dst_sh "odoo --version 2>/dev/null | grep -oP '\d+\.\d+' | head -1" 2>/dev/null || echo "")
-  [[ "$ver" == "19"* ]] && print_success "Odoo 19 installed (${ver})" \
-    || { print_error "Install may have failed (got: ${ver:-nothing})"; return 1; }
+  # Verify — try binary, then python import, then dpkg query
+  local ver=""
+  ver=$(dst_sh \
+    "/usr/bin/odoo --version 2>/dev/null \
+     || odoo --version 2>/dev/null \
+     || python3 -c 'import odoo; print(odoo.release.series)' 2>/dev/null \
+     || dpkg -l odoo 2>/dev/null | awk '/^ii/{print \$3}' \
+     || echo ''" \
+    2>/dev/null | grep -oP '\d+\.\d+' | head -1 || echo "")
+
+  if [[ "$ver" == "19"* ]]; then
+    print_success "Odoo 19 installed (${ver})"
+  elif dst_sh "test -x /usr/bin/odoo" 2>/dev/null; then
+    print_warn "/usr/bin/odoo exists but version check returned '${ver:-nothing}' — may be a Python path issue"
+    print_warn "Proceeding — will verify after schema finalization"
+  elif dst_sh "dpkg -l odoo 2>/dev/null | grep -q '^ii'"; then
+    print_warn "Odoo package registered in dpkg but binary not found at /usr/bin/odoo"
+    print_warn "Checking alternate paths..."
+    local alt; alt=$(dst_sh "find /usr /opt -name 'odoo-bin' -o -name 'odoo' -type f 2>/dev/null | head -1" | tr -d '[:space:]' || echo "")
+    [[ -n "$alt" ]] && print_info "Found: ${alt}" || { print_error "No Odoo binary found after install"; return 1; }
+  else
+    print_error "Odoo 19 installation appears to have failed"
+    print_info "Last install output:"
+    echo "$inst_out" | tail -15 | while IFS= read -r l; do echo -e "  ${GRAY}  $l${NC}"; done
+    print_info "Full log: ${MIGRATION_LOG}"
+    return 1
+  fi
 }
 
 setup_dst_postgres() {
