@@ -1037,53 +1037,25 @@ ensure_docker_on_dst() {
 pre_hop_sql_patches() {
   local hop_ver=$1 db=$2 prev_ver=$3
   if [[ "$prev_ver" == "14"* ]] && [[ "$hop_ver" == "15.0" ]]; then
-    print_info "Pre-hop patch (14→15): cleaning orphan ir_config_parameter rows..."
-    # Write SQL to a local temp file and scp it — avoids complex quoting through SSH layers.
-    # Deletes ALL ir_config_parameter records that have no XML ID in ir_model_data.
-    # Odoo 14 modules create these programmatically; Odoo 15 tries to INSERT them via its
-    # base XML data files, hitting the unique constraint on the key column.
-    # Odoo 15 re-creates them with correct default values on first run.
-    local sql_f; sql_f=$(mktemp /tmp/pre_hop_XXXXXX.sql)
-    cat > "$sql_f" <<'EOSQL'
-DELETE FROM ir_config_parameter
-WHERE id NOT IN (
-    SELECT res_id
-    FROM   ir_model_data
-    WHERE  model     = 'ir.config_parameter'
-    AND    res_id IS NOT NULL
-);
-EOSQL
-    dst_scp "$sql_f" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_pre_hop_patch.sql" 2>/dev/null
-    rm -f "$sql_f"
-    dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
-      -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
-      -f /tmp/_pre_hop_patch.sql 2>&1 && \
-      rm -f /tmp/_pre_hop_patch.sql" >> "$MIGRATION_LOG" 2>&1 || true
+    print_info "Pre-hop patch (14→15): cleaning ir_config_parameter conflicts..."
+    _icp_clean_for_hop "$db"
     print_success "Pre-hop patch applied"
   fi
 }
 
-# Delete a single conflicting ir_config_parameter key from PG logs, or fall back
-# to the broad orphan-DELETE if the log line can't be parsed.
-_fix_icp_conflict() {
-  local db=$1
-  local conf_key
-  conf_key=$(dst_sh \
-    "find /var/log/postgresql -name '*.log' 2>/dev/null | \
-     xargs grep -h 'Key (key)=' 2>/dev/null | tail -1 | \
-     grep -oP '(?<=Key \(key\)=\()[^)]+'" 2>/dev/null | tr -d '[:space:]' || echo "")
+# Full ir_config_parameter cleanup before a hop attempt.
+# Takes an optional extra list of known-conflicting keys to delete by name.
+# Using a temp SQL file avoids all SSH quoting complexity.
+_icp_clean_for_hop() {
+  local db=$1; shift
+  local extra_keys=("$@")  # additional keys to delete explicitly
 
-  if [[ -n "$conf_key" ]]; then
-    printf "  ${YELLOW}⚠  ir_config_parameter conflict: deleting key '%s'${NC}\n" "$conf_key"
-    log_msg "Deleting conflicting ir_config_parameter key: ${conf_key}"
-    dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
-      -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
-      -c \"DELETE FROM ir_config_parameter WHERE key = '${conf_key}';\"" \
-      >> "$MIGRATION_LOG" 2>&1 || true
-  else
-    print_warn "Cannot read key from PG log — running broad orphan cleanup..."
-    local sql_f; sql_f=$(mktemp /tmp/fix_icp_XXXXXX.sql)
-    cat > "$sql_f" <<'EOSQL'
+  local sql_f; sql_f=$(mktemp /tmp/icp_clean_XXXXXX.sql)
+
+  # Build the DELETE SQL
+  {
+    # 1. Orphan records (no XML ID in ir_model_data) — catches programmatically-created params
+    cat <<'EOSQL'
 DELETE FROM ir_config_parameter
 WHERE id NOT IN (
     SELECT res_id
@@ -1092,13 +1064,23 @@ WHERE id NOT IN (
     AND    res_id IS NOT NULL
 );
 EOSQL
-    dst_scp "$sql_f" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_fix_icp.sql" 2>/dev/null
-    rm -f "$sql_f"
-    dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
-      -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
-      -f /tmp/_fix_icp.sql 2>&1 && rm -f /tmp/_fix_icp.sql" \
-      >> "$MIGRATION_LOG" 2>&1 || true
-  fi
+    # 2. Known v14→v15 conflict keys — these DO have ir_model_data entries in v14 but
+    #    Odoo 15 registers them under DIFFERENT XML IDs, causing INSERT collision.
+    for k in \
+        "mail.catchall.alias" "mail.bounce.alias" \
+        "mail.catchall.domain" "mail.default.from" \
+        "${extra_keys[@]}"; do
+      [[ -z "$k" ]] && continue
+      printf "DELETE FROM ir_config_parameter WHERE key = '%s';\n" "$k"
+    done
+  } > "$sql_f"
+
+  dst_scp "$sql_f" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_icp_clean.sql" 2>/dev/null
+  rm -f "$sql_f"
+  dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
+    -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
+    -f /tmp/_icp_clean.sql 2>&1 && rm -f /tmp/_icp_clean.sql" \
+    >> "$MIGRATION_LOG" 2>&1 || true
 }
 
 run_one_hop() {
@@ -1126,11 +1108,11 @@ run_one_hop() {
   fi
   echo -e "  ${CYAN}ℹ  Image: ${use_img}${NC}"
 
-  # Auto-retry loop — handles UniqueViolation on ir_config_parameter by:
-  # 1. Restoring the pre-hop rollback dump
-  # 2. Deleting the specific conflicting key (parsed from PG logs)
-  # 3. Retrying the hop
-  local max_icp_retries=8 icp_retry=0
+  # Accumulate every conflicting key seen across retries.
+  # After rollback restore, ALL of them are deleted (not just the latest one).
+  # This is the key fix for the alternating mail.catchall.alias / mail.bounce.alias loop.
+  local -a _seen_icp_keys=()
+  local max_icp_retries=10 icp_retry=0
 
   while [[ $icp_retry -le $max_icp_retries ]]; do
     if [[ $icp_retry -gt 0 ]]; then
@@ -1166,13 +1148,31 @@ run_one_hop() {
       return 0
     fi
 
-    # ── UniqueViolation on ir_config_parameter — auto-fix and retry ──
+    # ── UniqueViolation on ir_config_parameter ────────────────────
     if echo "$hop_out" | grep -q "ir_config_parameter_key_uniq"; then
       if [[ $icp_retry -ge $max_icp_retries ]]; then
         print_error "Reached ${max_icp_retries} ir_config_parameter auto-fix attempts"
         break
       fi
-      # Restore rollback so the DB is clean before the fix + retry
+
+      # Parse the specific conflicting key from PG verbose log
+      local conf_key=""
+      conf_key=$(dst_sh \
+        "find /var/log/postgresql -name '*.log' 2>/dev/null | \
+         xargs grep -h 'Key (key)=' 2>/dev/null | tail -1 | \
+         grep -oP '(?<=Key \(key\)=\()[^)]+'" 2>/dev/null | tr -d '[:space:]' || echo "")
+
+      if [[ -n "$conf_key" ]]; then
+        # Add to accumulator only if not already tracked
+        local already=0
+        for k in "${_seen_icp_keys[@]}"; do [[ "$k" == "$conf_key" ]] && already=1; done
+        [[ $already -eq 0 ]] && _seen_icp_keys+=("$conf_key")
+        printf "  ${YELLOW}⚠  ir_config_parameter conflict: '%s' (total tracked: %d)${NC}\n" \
+          "$conf_key" "${#_seen_icp_keys[@]}"
+        log_msg "ICP conflict key: ${conf_key} | all seen: ${_seen_icp_keys[*]}"
+      fi
+
+      # Restore rollback so the DB is clean for the next attempt
       if [[ -n "$rollback_file" ]]; then
         dst_sh "test -s '${rollback_file}'" 2>/dev/null && {
           print_info "Restoring rollback for clean retry..."
@@ -1189,7 +1189,12 @@ run_one_hop() {
           print_success "Rollback restored"
         }
       fi
-      _fix_icp_conflict "$db"
+
+      # Run full ICP cleanup: orphan DELETE + all accumulated conflicting keys.
+      # Passing the accumulated keys ensures ALL of them are removed even though
+      # the rollback just brought them back.
+      _icp_clean_for_hop "$db" "${_seen_icp_keys[@]}"
+
       ((icp_retry++))
       continue
     fi
