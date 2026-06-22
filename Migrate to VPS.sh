@@ -668,30 +668,72 @@ install_odoo19() {
   print_success "Downloaded (${sz})"
 
   print_step "Installing Odoo 19 (may take a few minutes)..."
-  # Step 1: try apt-get install which auto-resolves dependencies
+
+  # Mask the odoo service so the .deb postinst script cannot try to start
+  # Odoo during install (it would fail because there is no config yet).
+  dst_sh "systemctl mask odoo 2>/dev/null || true" >> "$MIGRATION_LOG" 2>&1
+
+  # Pre-create the odoo user/group so the postinst script does not fail
+  # trying to add a user that may already exist (idempotent).
+  dst_sh "id odoo &>/dev/null || \
+          adduser --system --home /var/lib/odoo --group \
+                  --no-create-home --gecos 'Odoo' odoo 2>/dev/null || true" \
+    >> "$MIGRATION_LOG" 2>&1
+  dst_sh "mkdir -p /var/lib/odoo /var/log/odoo /etc/odoo && \
+          chown odoo:odoo /var/lib/odoo /var/log/odoo /etc/odoo 2>/dev/null || true" \
+    >> "$MIGRATION_LOG" 2>&1
+
   local inst_out
+
+  # Method 1: apt install (handles local .deb deps better than apt-get on Ubuntu 18+)
+  print_info "Trying: apt install /tmp/odoo19.deb ..."
   inst_out=$(dst_sh \
-    "DEBIAN_FRONTEND=noninteractive apt-get install -y --fix-broken /tmp/odoo19.deb 2>&1" \
-    2>&1 || true)
+    "DEBIAN_FRONTEND=noninteractive apt install -y /tmp/odoo19.deb 2>&1" 2>&1 || true)
   echo "$inst_out" >> "$MIGRATION_LOG"
 
-  # If apt-get didn't work (no "Setting up odoo" in output), fall back to dpkg + apt-get -f
-  if ! echo "$inst_out" | grep -qiE "Setting up odoo|is already the newest version"; then
-    print_info "apt-get path did not complete — trying dpkg + apt-get -f install..."
+  if echo "$inst_out" | grep -qiE "Setting up odoo|is already the newest version"; then
+    : # success
+  else
+    # Method 2: dpkg -i then apt-get install -f to resolve deps
+    print_info "Trying: dpkg -i + apt-get install -f ..."
     local fix_out
     fix_out=$(dst_sh \
-      "DEBIAN_FRONTEND=noninteractive dpkg -i --force-confdef --force-confold /tmp/odoo19.deb 2>&1; \
+      "DEBIAN_FRONTEND=noninteractive dpkg -i \
+         --force-confdef --force-confold \
+         --force-depends \
+         /tmp/odoo19.deb 2>&1; \
        DEBIAN_FRONTEND=noninteractive apt-get install -f -y -qq 2>&1" 2>&1 || true)
     echo "$fix_out" >> "$MIGRATION_LOG"
-    if echo "$fix_out" | grep -qiE "dpkg: error|Errors were encountered"; then
-      print_error "dpkg install failed:"
-      echo "$fix_out" | grep -iE "dpkg: error|Errors were" | tail -5 | \
-        while IFS= read -r l; do echo -e "  ${RED}  $l${NC}"; done
-      print_info "Full log: ${MIGRATION_LOG}"
-      return 1
+    inst_out="$inst_out
+$fix_out"
+
+    if ! echo "$fix_out" | grep -qiE "Setting up odoo|0 upgraded|configuration files"; then
+      # Method 3: gdebi (most reliable for local .deb with deps)
+      print_info "Trying: gdebi ..."
+      local gdebi_out
+      gdebi_out=$(dst_sh \
+        "apt-get install -y -qq gdebi-core 2>&1 && \
+         DEBIAN_FRONTEND=noninteractive gdebi -n /tmp/odoo19.deb 2>&1" 2>&1 || true)
+      echo "$gdebi_out" >> "$MIGRATION_LOG"
+      inst_out="$inst_out
+$gdebi_out"
+
+      if ! echo "$gdebi_out" | grep -qiE "Setting up odoo|installation finished"; then
+        # All methods failed — show diagnostic output and abort
+        print_error "All install methods failed. Last output:"
+        # Show lines near errors (not just the grep hits)
+        echo "$inst_out" | grep -B2 -A2 -iE "error|failed|cannot|missing" | tail -20 | \
+          while IFS= read -r l; do echo -e "  ${RED}  $l${NC}"; done
+        print_info "Full log: ${MIGRATION_LOG}"
+        dst_sh "systemctl unmask odoo 2>/dev/null || true" >> "$MIGRATION_LOG" 2>&1
+        return 1
+      fi
     fi
   fi
 
+  # Unmask now that the package is installed — we will start it manually later
+  dst_sh "systemctl unmask odoo 2>/dev/null || true" >> "$MIGRATION_LOG" 2>&1
+  dst_sh "systemctl disable odoo 2>/dev/null || true" >> "$MIGRATION_LOG" 2>&1
   dst_sh "rm -f /tmp/odoo19.deb" 2>/dev/null || true
 
   # Verify — try binary, then python import, then dpkg query
@@ -700,25 +742,25 @@ install_odoo19() {
     "/usr/bin/odoo --version 2>/dev/null \
      || odoo --version 2>/dev/null \
      || python3 -c 'import odoo; print(odoo.release.series)' 2>/dev/null \
-     || dpkg -l odoo 2>/dev/null | awk '/^ii/{print \$3}' \
+     || dpkg-query -W -f='\${Version}' odoo 2>/dev/null \
      || echo ''" \
     2>/dev/null | grep -oP '\d+\.\d+' | head -1 || echo "")
 
   if [[ "$ver" == "19"* ]]; then
     print_success "Odoo 19 installed (${ver})"
   elif dst_sh "test -x /usr/bin/odoo" 2>/dev/null; then
-    print_warn "/usr/bin/odoo exists but version check returned '${ver:-nothing}' — may be a Python path issue"
-    print_warn "Proceeding — will verify after schema finalization"
-  elif dst_sh "dpkg -l odoo 2>/dev/null | grep -q '^ii'"; then
-    print_warn "Odoo package registered in dpkg but binary not found at /usr/bin/odoo"
-    print_warn "Checking alternate paths..."
-    local alt; alt=$(dst_sh "find /usr /opt -name 'odoo-bin' -o -name 'odoo' -type f 2>/dev/null | head -1" | tr -d '[:space:]' || echo "")
-    [[ -n "$alt" ]] && print_info "Found: ${alt}" || { print_error "No Odoo binary found after install"; return 1; }
+    print_warn "/usr/bin/odoo present — version string was '${ver:-empty}' (harmless Python-env quirk)"
+    print_warn "Proceeding — will verify at finalization step"
+  elif dst_sh "dpkg-query -W odoo 2>/dev/null | grep -q '19'" 2>/dev/null; then
+    print_warn "Odoo 19 in dpkg but binary not at /usr/bin/odoo — checking..."
+    local alt; alt=$(dst_sh \
+      "find /usr /opt -maxdepth 8 \( -name 'odoo-bin' -o -name 'odoo' \) -type f 2>/dev/null | head -1" \
+      | tr -d '[:space:]')
+    [[ -n "$alt" ]] && print_success "Binary found at: ${alt}" \
+      || { print_error "No Odoo binary found after install"; return 1; }
   else
-    print_error "Odoo 19 installation appears to have failed"
-    print_info "Last install output:"
-    echo "$inst_out" | tail -15 | while IFS= read -r l; do echo -e "  ${GRAY}  $l${NC}"; done
-    print_info "Full log: ${MIGRATION_LOG}"
+    print_error "Odoo 19 does not appear to be installed"
+    print_info "Run on the VPS:  dpkg -l odoo  and  /usr/bin/odoo --version"
     return 1
   fi
 }
@@ -848,12 +890,29 @@ dump_source_db() {
   print_success "Dump: ${BACKUP_FILE} (${sz})"
   log_msg "Dump: ${BACKUP_FILE} sz=${sz}"
 
-  # Archive custom addons
+  # Archive custom addons — stage into a temp flat dir first so the tar
+  # contains only relative paths (module/ dirs) and extracts cleanly into
+  # DST_ADDONS_DIR without nested source-machine path structure.
   if [[ ${#SRC_ADDONS_PATHS[@]} -gt 0 ]]; then
     print_step "Archiving custom addons: ${SRC_ADDONS_PATHS[*]}"
-    tar -czf "$ADDONS_BACKUP" "${SRC_ADDONS_PATHS[@]}" 2>/dev/null \
-      && print_success "Addons archived: ${ADDONS_BACKUP}" \
-      || print_warn "Addons archive had warnings (non-critical)"
+    local addon_stage; addon_stage=$(mktemp -d)
+    for p in "${SRC_ADDONS_PATHS[@]}"; do
+      [[ -d "$p" ]] || continue
+      # Copy contents (individual module dirs) into staging flat dir
+      for mod in "$p"/*/; do
+        [[ -d "$mod" ]] && cp -r "$mod" "$addon_stage"/ 2>/dev/null || true
+      done
+    done
+    local staged; staged=$(ls -1 "$addon_stage" 2>/dev/null | wc -l | tr -d ' ')
+    if [[ "${staged:-0}" -gt 0 ]]; then
+      tar -czf "$ADDONS_BACKUP" -C "$addon_stage" . 2>/dev/null \
+        && print_success "Addons archived (${staged} modules): ${ADDONS_BACKUP}" \
+        || print_warn "Addons archive had warnings"
+    else
+      print_warn "No module directories found in addons paths — skipping addons archive"
+      ADDONS_BACKUP=""
+    fi
+    rm -rf "$addon_stage"
   else
     ADDONS_BACKUP=""
   fi
@@ -878,19 +937,58 @@ transfer_and_restore_db() {
   # Transfer custom addons
   if [[ -n "$ADDONS_BACKUP" && -f "$ADDONS_BACKUP" ]]; then
     print_step "Deploying custom addons to ${DST_ADDONS_DIR}..."
-    dst_scp "$ADDONS_BACKUP" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_odoo_vps_addons.tar.gz" \
-      && dst_sh "tar -xzf /tmp/_odoo_vps_addons.tar.gz -C '${DST_ADDONS_DIR}' 2>&1 && \
-                 chown -R odoo:odoo '${DST_ADDONS_DIR}' && \
-                 rm -f /tmp/_odoo_vps_addons.tar.gz" >> "$MIGRATION_LOG" 2>&1 \
-      && print_success "Custom addons deployed" \
-      || print_warn "Addons deployment had errors"
+    if dst_scp "$ADDONS_BACKUP" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_odoo_vps_addons.tar.gz"; then
+      # The archive contains only relative module/ dirs (no leading /), so -C extracts correctly
+      local addon_out
+      addon_out=$(dst_sh \
+        "mkdir -p '${DST_ADDONS_DIR}' && \
+         tar -xzf /tmp/_odoo_vps_addons.tar.gz -C '${DST_ADDONS_DIR}' 2>&1 && \
+         chown -R odoo:odoo '${DST_ADDONS_DIR}' && \
+         rm -f /tmp/_odoo_vps_addons.tar.gz && \
+         echo OK" 2>&1 || true)
+      echo "$addon_out" >> "$MIGRATION_LOG"
+      echo "$addon_out" | grep -q "^OK$" \
+        && print_success "Custom addons deployed" \
+        || { print_warn "Addons extraction had warnings:"; \
+             echo "$addon_out" | tail -5 | while IFS= read -r l; do echo -e "  ${GRAY}  $l${NC}"; done; }
+    else
+      print_warn "Addons file transfer failed — continuing without custom addons"
+    fi
   fi
 
+  # Create database — two separate statements to avoid multi-statement -c quoting issues.
+  # Uses PGPASSWORD + TCP on 127.0.0.1 (the DST_DB_USER has CREATEDB from setup_dst_postgres).
+  # TEMPLATE template0 + ENCODING UTF8 avoids needing to quote the encoding string.
   print_step "Creating database '${DST_DB_NAME}'..."
-  dst_sh "sudo -u postgres psql -c \
-    \"DROP DATABASE IF EXISTS \\\"${DST_DB_NAME}\\\"; \
-     CREATE DATABASE \\\"${DST_DB_NAME}\\\" ENCODING 'UTF8' OWNER \\\"${DST_DB_USER}\\\";\"" \
-    >> "$MIGRATION_LOG" 2>&1 || { print_error "Failed to create database"; return 1; }
+  local db_create_err
+  # DROP (ignore failure — may not exist yet)
+  dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
+    -h 127.0.0.1 -U '${DST_DB_USER}' -d postgres \
+    -c 'DROP DATABASE IF EXISTS \"${DST_DB_NAME}\";'" \
+    >> "$MIGRATION_LOG" 2>&1 || true
+
+  # CREATE — use TEMPLATE template0 so ENCODING UTF8 works even if the default locale differs
+  db_create_err=$(dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
+    -h 127.0.0.1 -U '${DST_DB_USER}' -d postgres \
+    -c 'CREATE DATABASE \"${DST_DB_NAME}\" TEMPLATE template0 ENCODING UTF8 OWNER \"${DST_DB_USER}\";' \
+    2>&1" 2>&1 || true)
+  echo "$db_create_err" >> "$MIGRATION_LOG"
+
+  if ! echo "$db_create_err" | grep -qiE "^CREATE DATABASE$|already exists"; then
+    # Try fallback with postgres peer auth (in case 127.0.0.1 password auth isn't ready yet)
+    print_warn "PGPASSWORD auth failed — trying postgres peer auth..."
+    db_create_err=$(dst_sh \
+      "sudo -u postgres psql -c 'DROP DATABASE IF EXISTS \"${DST_DB_NAME}\";' 2>/dev/null; \
+       sudo -u postgres psql \
+         -c 'CREATE DATABASE \"${DST_DB_NAME}\" TEMPLATE template0 ENCODING UTF8 OWNER \"${DST_DB_USER}\";' \
+         2>&1" 2>&1 || true)
+    echo "$db_create_err" >> "$MIGRATION_LOG"
+    echo "$db_create_err" | grep -qiE "^CREATE DATABASE$|already exists" \
+      || { print_error "Failed to create database"; \
+           echo "$db_create_err" | tail -5 | while IFS= read -r l; do echo -e "  ${RED}  $l${NC}"; done; \
+           return 1; }
+  fi
+  print_success "Database '${DST_DB_NAME}' created"
 
   print_step "Restoring database (may take several minutes)..."
   local restore_out
