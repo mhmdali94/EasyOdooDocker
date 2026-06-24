@@ -144,7 +144,9 @@ rand_pass() {
 
 # Build the base SSH options string (no auth-specific flags)
 _ssh_base_opts() {
-  echo "-o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -p ${DST_SSH_PORT}"
+  # ServerAliveInterval keeps the connection alive during long operations (large restore dumps).
+  # -T disables PTY allocation — not needed for scripted commands and avoids interference.
+  echo "-T -o StrictHostKeyChecking=accept-new -o ConnectTimeout=20 -o ServerAliveInterval=60 -o ServerAliveCountMax=20 -p ${DST_SSH_PORT}"
 }
 
 # Verify SSH connectivity and set up ControlMaster for key auth
@@ -848,18 +850,19 @@ step_create_docker() {
   print_info "Starting PostgreSQL container (db only)..."
   dst "cd '${DST_BASE_DIR}' && docker compose up -d db"
 
-  # Wait up to 90 s for PostgreSQL to be ready
+  # Wait up to 180 s for PostgreSQL to be ready.
+  # First-time volume initialization (creating the data directory) can take 30-60s.
   print_info "Waiting for PostgreSQL to accept connections..."
   local waited=0
   while ! dst "docker exec ${DST_INSTANCE_NAME}_db pg_isready -U ${DST_PG_USER}" &>/dev/null; do
     sleep 3
     ((waited += 3))
-    [[ $waited -ge 90 ]] && {
-      print_error "PostgreSQL container did not become ready in 90s."
+    [[ $waited -ge 180 ]] && {
+      print_error "PostgreSQL container did not become ready in 180s."
       print_info  "Check: docker logs ${DST_INSTANCE_NAME}_db"
       exit 1
     }
-    printf "  ."
+    printf "."
   done
   echo ""
   print_success "PostgreSQL is ready"
@@ -906,17 +909,31 @@ step_restore_db() {
   # ── Transfer dump to destination if remote ─────────────────
   if [[ "$DST_TYPE" == "remote" ]]; then
     print_info "Transferring dump.sql to ${DST_SSH_HOST}..."
-    dst_put "$dump" "$DST_BASE_DIR"
+    if ! dst_put "$dump" "$DST_BASE_DIR"; then
+      print_error "Failed to transfer dump.sql to ${DST_SSH_HOST}."
+      print_info  "Check network connectivity and disk space on ${DST_SSH_HOST}."
+      exit 1
+    fi
     dump="${DST_BASE_DIR}/dump.sql"
+    # Verify file actually arrived
+    if ! dst "test -f '${dump}'"; then
+      print_error "dump.sql not found on remote at ${dump} after transfer."
+      exit 1
+    fi
     print_success "dump.sql transferred ($(dst "du -sh '${dump}'" | cut -f1))"
   fi
 
   # ── Restore SQL dump ───────────────────────────────────────
   print_info "Restoring SQL dump — this may take several minutes for large databases..."
+  print_info "Odoo dumps often emit non-fatal errors (duplicate objects, role ownership)."
+  print_info "Those are harmless — the restore continues regardless."
+  echo ""
 
   local restore_ok=0
   if [[ "$DST_TYPE" == "remote" ]]; then
-    # Stream dump.sql from the remote file into psql running in the container
+    # Stream dump.sql from the remote file into psql running in the container.
+    # The < redirection is evaluated by the REMOTE shell, not the local one.
+    # ON_ERROR_STOP=0 lets psql continue past harmless Odoo dump errors.
     if dst "docker exec -i ${DST_INSTANCE_NAME}_db \
         psql -U ${DST_PG_USER} -d '${DST_DB}' -v ON_ERROR_STOP=0 --quiet \
         < '${dump}'" ; then
@@ -932,9 +949,23 @@ step_restore_db() {
 
   if [[ $restore_ok -eq 0 ]]; then
     print_warn "psql exited with a non-zero code — some statements may have failed."
-    print_info "This is often harmless (duplicate objects, ownership warnings)."
-    print_info "Continuing — verify the data after migration completes."
+    print_info "This is often harmless. Checking table count to verify..."
   fi
+
+  # ── Post-restore sanity check ─────────────────────────────
+  local table_count
+  table_count=$(dst "${pg_admin} -d '${DST_DB}' -tAc \
+    \"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema='public'\"" \
+    2>/dev/null || echo "0")
+  table_count="${table_count//[^0-9]/}"   # strip whitespace/newlines
+  if [[ -z "$table_count" || "$table_count" -lt 10 ]]; then
+    print_error "Restore check failed — only ${table_count:-0} tables found in '${DST_DB}'."
+    print_info  "The dump may not have been applied correctly."
+    print_info  "Common causes: large dump timed out, psql auth error, disk full."
+    print_info  "Run manually:  docker exec -i ${DST_INSTANCE_NAME}_db psql -U ${DST_PG_USER} -d '${DST_DB}' < /path/to/dump.sql"
+    exit 1
+  fi
+  print_success "Restore verified — ${table_count} tables found in '${DST_DB}'"
 
   # ── Grant ownership to our DB user ────────────────────────
   dst "${pg_admin} -c \"GRANT ALL PRIVILEGES ON DATABASE \\\"${DST_DB}\\\" TO ${DST_PG_USER};\""
@@ -971,6 +1002,7 @@ step_restore_filestore() {
       -v ${DST_BASE_DIR}/filestore_import/filestore:/src:ro \
       alpine sh -c 'mkdir -p /var/lib/odoo/filestore/${DST_DB} && \
         cp -r /src/. /var/lib/odoo/filestore/${DST_DB}/ && \
+        chown -R 101:101 /var/lib/odoo && \
         echo done'"
 
     dst "rm -rf '${DST_BASE_DIR}/filestore_import'"
@@ -983,6 +1015,7 @@ step_restore_filestore() {
       -v "${fs_abs}:/src:ro" \
       alpine sh -c "mkdir -p /var/lib/odoo/filestore/${DST_DB} && \
         cp -r /src/. /var/lib/odoo/filestore/${DST_DB}/ && \
+        chown -R 101:101 /var/lib/odoo && \
         echo done"
   fi
 
@@ -996,20 +1029,26 @@ step_start_odoo() {
 
   dst "cd '${DST_BASE_DIR}' && docker compose up -d odoo"
 
-  # Build the URL to poll
   local check_host
   if [[ "$DST_TYPE" == "remote" ]]; then
     check_host="$DST_SSH_HOST"
   else
     check_host="127.0.0.1"
   fi
-  local check_url="http://${check_host}:${DST_WEB_PORT}/web/login"
 
+  # Poll from the DESTINATION machine so firewall rules between source and dest don't interfere.
   print_info "Waiting for Odoo to respond on port ${DST_WEB_PORT}..."
   local waited=0
   while true; do
     local code
-    code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 "$check_url" 2>/dev/null || echo "000")
+    if [[ "$DST_TYPE" == "remote" ]]; then
+      code=$(dst "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 \
+        'http://127.0.0.1:${DST_WEB_PORT}/web/login'" 2>/dev/null || echo "000")
+    else
+      code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 \
+        "http://127.0.0.1:${DST_WEB_PORT}/web/login" 2>/dev/null || echo "000")
+    fi
+    code="${code//[^0-9]/}"
     case "$code" in
       200|302|303)
         break ;;
@@ -1018,7 +1057,7 @@ step_start_odoo() {
     ((waited += 4))
     if [[ $waited -ge 120 ]]; then
       print_warn "Odoo has not responded after 2 min — it may still be starting."
-      print_info "Check logs: docker logs -f ${DST_INSTANCE_NAME}_odoo"
+      print_info "Check logs: docker exec ${DST_INSTANCE_NAME}_odoo tail -30 /var/log/odoo/odoo.log"
       return 0
     fi
     printf "."
@@ -1039,14 +1078,21 @@ step_verify() {
     check_host="127.0.0.1"
   fi
 
-  # HTTP check
+  # HTTP check from destination machine to avoid firewall false negatives
   local code
-  code=$(curl -s -o /dev/null -w "%{http_code}" \
-    --connect-timeout 10 "http://${check_host}:${DST_WEB_PORT}/web/login" 2>/dev/null || echo "000")
+  if [[ "$DST_TYPE" == "remote" ]]; then
+    code=$(dst "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 10 \
+      'http://127.0.0.1:${DST_WEB_PORT}/web/login'" 2>/dev/null || echo "000")
+  else
+    code=$(curl -s -o /dev/null -w "%{http_code}" \
+      --connect-timeout 10 "http://127.0.0.1:${DST_WEB_PORT}/web/login" 2>/dev/null || echo "000")
+  fi
+  code="${code//[^0-9]/}"
   if [[ "$code" =~ ^(200|302|303)$ ]]; then
     print_success "Web UI: http://${check_host}:${DST_WEB_PORT}  (HTTP $code)"
   else
     print_warn "Web UI returned HTTP $code — may still be initializing."
+    print_info  "Check logs: docker exec ${DST_INSTANCE_NAME}_odoo tail -30 /var/log/odoo/odoo.log"
   fi
 
   # Container status
