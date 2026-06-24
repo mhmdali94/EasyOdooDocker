@@ -1092,28 +1092,49 @@ pre_hop_sql_patches() {
   fi
 }
 
-# Remove ALL res_lang rows and their ir_model_data entries before the 17→18 hop.
+# Before the 17→18 hop: install a PostgreSQL RULE that makes res_lang inserts
+# idempotent (ON CONFLICT DO UPDATE no-op). This is necessary because Odoo 18
+# with native (non-OpenUpgrade) images has multiple modules — including custom
+# modules — that each INSERT the same language names. The rule converts the
+# second INSERT into an UPDATE-returning-existing-row, so Odoo's
+# `INSERT ... RETURNING id` still gets a valid ID back.
 #
-# WHY nuclear: Odoo 18 changed how languages are registered. It tries to INSERT
-# language rows with new XML IDs; the rows already exist from earlier hops, so
-# res_lang_name_uniq fires. Deduplication doesn't help — the conflict is between
-# the EXISTING single row and Odoo 18's NEW INSERT, not between two existing rows.
+# Also clears res_lang rows and ir_model_data entries so Odoo 18 creates them
+# fresh with the correct v18 XML IDs.
 #
-# SAFE: partner/user lang fields store the language CODE as varchar, not an FK,
-# so deleting res_lang rows does not orphan any record.
-# AFTER MIGRATION: re-install Arabic (and any other non-English languages) via
+# AFTER MIGRATION: re-activate Arabic (and any non-English languages) via
 # Settings → Technical → Languages → Activate.
 _reslang_clean_for_hop() {
   local db=$1
   local sql_f; sql_f=$(mktemp /tmp/reslang_clean_XXXXXX.sql)
   cat > "$sql_f" <<'EOSQL'
--- Log existing languages for user reference (visible in migration log)
+-- Log existing languages (saved in migration log for reference)
 SELECT code, name FROM res_lang ORDER BY code;
 
--- Remove all language XML ID registrations so Odoo 18 re-registers fresh
+-- Ensure the unique constraint exists before the RULE can use ON CONFLICT (name).
+-- Odoo 17 has this constraint; if somehow missing, add it now.
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conname = 'res_lang_name_uniq' AND conrelid = 'res_lang'::regclass
+  ) THEN
+    ALTER TABLE res_lang ADD CONSTRAINT res_lang_name_uniq UNIQUE (name);
+  END IF;
+END $$;
+
+-- Install UPSERT RULE: converts any duplicate-name INSERT into a no-op UPDATE
+-- that still returns the existing row (so Odoo's RETURNING id clause works).
+-- This prevents res_lang_name_uniq violations when multiple modules each try
+-- to INSERT the same language in the same --update=all run.
+CREATE OR REPLACE RULE _mig_res_lang_upsert AS ON INSERT TO res_lang DO INSTEAD
+  INSERT INTO res_lang SELECT NEW.*
+  ON CONFLICT (name) DO UPDATE SET name = res_lang.name
+  RETURNING res_lang.*;
+
+-- Remove XML ID registrations so Odoo 18 re-registers languages with v18 IDs
 DELETE FROM ir_model_data WHERE model = 'res.lang';
 
--- Remove all language rows — Odoo 18 re-creates them via --update=all
+-- Remove all language rows — Odoo 18 re-creates them fresh
 DELETE FROM res_lang;
 EOSQL
   dst_scp "$sql_f" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_reslang_clean.sql" 2>/dev/null
@@ -1123,13 +1144,38 @@ EOSQL
     -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
     -f /tmp/_reslang_clean.sql 2>&1 && rm -f /tmp/_reslang_clean.sql" 2>&1 || true)
   echo "$out" >> "$MIGRATION_LOG"
-  # Show which languages were removed so the user knows to re-activate them
   local lang_list
   lang_list=$(echo "$out" | grep -E '^\s+(ar|en|fr|de|es|tr|ur)' | tr -s ' ' | head -10 || true)
   [[ -n "$lang_list" ]] && {
     print_info "Languages cleared (re-activate after migration):"
     echo "$lang_list" | while IFS= read -r l; do echo -e "  ${GRAY}  $l${NC}"; done
   }
+}
+
+# After the 17→18 hop succeeds: drop the migration RULE, then deduplicate
+# any residual duplicate language rows (should be none, but just in case).
+_reslang_post_hop() {
+  local db=$1
+  local sql_f; sql_f=$(mktemp /tmp/reslang_post_XXXXXX.sql)
+  cat > "$sql_f" <<'EOSQL'
+-- Remove the migration UPSERT rule
+DROP RULE IF EXISTS _mig_res_lang_upsert ON res_lang;
+
+-- Deduplicate by name (keep lowest id per name)
+DELETE FROM res_lang
+WHERE id NOT IN (SELECT MIN(id) FROM res_lang GROUP BY name);
+
+-- Deduplicate by code (keep lowest id per code)
+DELETE FROM res_lang
+WHERE id NOT IN (SELECT MIN(id) FROM res_lang GROUP BY code);
+EOSQL
+  dst_scp "$sql_f" "${DST_SSH_USER}@${DST_SSH_HOST}:/tmp/_reslang_post.sql" 2>/dev/null
+  rm -f "$sql_f"
+  dst_sh "PGPASSWORD='${DST_DB_PASS}' psql \
+    -h 127.0.0.1 -U '${DST_DB_USER}' -d '${db}' \
+    -f /tmp/_reslang_post.sql 2>&1 && rm -f /tmp/_reslang_post.sql" \
+    >> "$MIGRATION_LOG" 2>&1 || true
+  print_success "Post-hop res_lang cleanup done"
 }
 
 # Full ir_config_parameter cleanup before a hop attempt.
@@ -1368,6 +1414,9 @@ run_all_hops() {
 
     pre_hop_sql_patches "$hop_ver" "$db" "$prev_ver"
     run_one_hop "$hop_ver" "$db" "$hop_bk" || return 1
+
+    # Post-hop cleanup: drop the migration RULE and deduplicate res_lang
+    [[ "$hop_ver" == "18.0" ]] && _reslang_post_hop "$db"
 
     prev_ver="$hop_ver"
     ((current++))
