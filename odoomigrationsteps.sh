@@ -612,6 +612,11 @@ step_download() {
   echo ""
 
   mkdir -p "$WORK_DIR"
+
+  # Clean up any stale zip/extract from a previous failed run for this DB
+  rm -f "$WORK_DIR/${SRC_DB}_"*.zip 2>/dev/null || true
+  rm -rf "$WORK_DIR/${SRC_DB}_"*/ 2>/dev/null || true
+
   BACKUP_ZIP="$WORK_DIR/${SRC_DB}_$(date +%Y%m%d_%H%M%S).zip"
 
   # Write the HTTP status code to a separate temp file so the progress
@@ -732,12 +737,11 @@ step_create_docker() {
       print_success "Docker already installed"
     fi
     # Ensure docker compose (v2 plugin) is available
-    if ! dst "docker compose version" &>/dev/null; then
+    if ! dst "docker compose version" > /dev/null 2>&1; then
       print_info "Installing docker-compose-plugin..."
       dst "apt-get install -y docker-compose-plugin 2>/dev/null || true"
     fi
-    # Confirm after install
-    if ! dst "docker compose version" &>/dev/null; then
+    if ! dst "docker compose version" > /dev/null 2>&1; then
       print_error "docker compose v2 is not available on ${DST_SSH_HOST}."
       print_info  "Install manually: apt-get install docker-compose-plugin"
       exit 1
@@ -745,9 +749,21 @@ step_create_docker() {
     print_success "docker compose v2 available"
   fi
 
+  # ── Wipe any previous containers + DB volume for this instance ──
+  # POSTGRES_PASSWORD is only applied on FIRST volume initialization.
+  # If we reuse an old volume, postgres keeps the old password → auth fail.
+  # Solution: always start fresh. Odoo data volume is wiped too for consistency.
+  print_info "Removing any previous containers and volumes for '${DST_INSTANCE_NAME}'..."
+  dst "docker stop ${DST_INSTANCE_NAME}_odoo ${DST_INSTANCE_NAME}_db 2>/dev/null; \
+       docker rm   ${DST_INSTANCE_NAME}_odoo ${DST_INSTANCE_NAME}_db 2>/dev/null; \
+       docker volume rm ${DST_INSTANCE_NAME}_db_data ${DST_INSTANCE_NAME}_odoo_data 2>/dev/null; \
+       true"
+  print_success "Clean slate — old containers/volumes removed (or didn't exist)"
+
   # ── Create directory structure ─────────────────────────────
   print_info "Creating directory structure..."
-  dst "mkdir -p '${DST_BASE_DIR}/addons' '${DST_BASE_DIR}/config' '${DST_BASE_DIR}/logs'"
+  # logs dir gets open permissions so the container's odoo user can write to it
+  dst "mkdir -p '${DST_BASE_DIR}/addons' '${DST_BASE_DIR}/config' '${DST_BASE_DIR}/logs' && chmod 777 '${DST_BASE_DIR}/logs'"
 
   # ── Write odoo.conf ────────────────────────────────────────
   # Uses printf instead of a heredoc — immune to CRLF line endings.
@@ -847,6 +863,16 @@ step_create_docker() {
   done
   echo ""
   print_success "PostgreSQL is ready"
+
+  # Sync the PG user password with odoo.conf.
+  # IMPORTANT: force md5 storage to match the pg_hba.conf 'md5' auth method.
+  # PostgreSQL 13+ defaults to scram-sha-256 storage, but pg_hba.conf uses md5.
+  # A scram-stored password cannot satisfy an md5 auth challenge → auth fails.
+  # Unix-socket local connections use trust auth, so no password is needed here.
+  dst "docker exec ${DST_INSTANCE_NAME}_db \
+    psql -U ${DST_PG_USER} -d postgres \
+    -c \"SET password_encryption='md5'; ALTER USER ${DST_PG_USER} WITH PASSWORD '${DST_PG_PASS}';\""
+  print_success "PostgreSQL password set (md5, synced with odoo.conf)"
 }
 
 # ── STEP 6: Restore database ──────────────────────────────────
@@ -936,12 +962,13 @@ step_restore_filestore() {
   if [[ "$DST_TYPE" == "remote" ]]; then
     print_info "Transferring filestore to ${DST_SSH_HOST}..."
     dst "mkdir -p '${DST_BASE_DIR}/filestore_import'"
-    dst_put "$EXTRACT_DIR/filestore/." "${DST_BASE_DIR}/filestore_import"
+    # Transfer the filestore directory contents (trailing / on src = transfer contents)
+    dst_put "$EXTRACT_DIR/filestore" "${DST_BASE_DIR}/filestore_import"
 
     print_info "Copying filestore into Docker volume..."
     dst "docker run --rm \
       -v ${DST_INSTANCE_NAME}_odoo_data:/var/lib/odoo \
-      -v ${DST_BASE_DIR}/filestore_import:/src:ro \
+      -v ${DST_BASE_DIR}/filestore_import/filestore:/src:ro \
       alpine sh -c 'mkdir -p /var/lib/odoo/filestore/${DST_DB} && \
         cp -r /src/. /var/lib/odoo/filestore/${DST_DB}/ && \
         echo done'"
@@ -1073,6 +1100,43 @@ print_summary() {
   echo -e "    docker exec -it ${DST_INSTANCE_NAME}_odoo odoo shell -d ${DST_DB}"
   echo ""
   echo -e "  ${GRAY}  Backup saved at: $BACKUP_ZIP${NC}"
+
+  # ── Odoo Manager registration ─────────────────────────────
+  # The Odoo Manager script tracks instances in ~/docker/.odoo_manager_instances.
+  # Register this instance automatically if the Manager is present on destination.
+  local manager_meta=""
+  if [[ "$DST_TYPE" == "remote" ]]; then
+    manager_meta=$(dst "cat \$HOME/docker/.odoo_manager_instances 2>/dev/null" | \
+      grep "^${DST_INSTANCE_NAME}|" 2>/dev/null || true)
+  else
+    manager_meta=$(grep "^${DST_INSTANCE_NAME}|" \
+      "$HOME/docker/.odoo_manager_instances" 2>/dev/null || true)
+  fi
+
+  if [[ -z "$manager_meta" ]]; then
+    # Not yet registered — write the entry
+    local meta_line="${DST_INSTANCE_NAME}|14.0|${DST_BASE_DIR}|${DST_WEB_PORT}|${DST_LONGPOLL_PORT}|${DST_PG_USER}|${DST_PG_PASS}|${DST_MASTER_PASS}|migrated"
+    if [[ "$DST_TYPE" == "remote" ]]; then
+      dst "mkdir -p \"\$HOME/docker\" && \
+        grep -v '^${DST_INSTANCE_NAME}|' \"\$HOME/docker/.odoo_manager_instances\" > /tmp/.omtmp 2>/dev/null || true; \
+        echo '${meta_line}' >> /tmp/.omtmp; \
+        mv /tmp/.omtmp \"\$HOME/docker/.odoo_manager_instances\""
+    else
+      mkdir -p "$HOME/docker"
+      local f="$HOME/docker/.odoo_manager_instances"
+      touch "$f"
+      grep -v "^${DST_INSTANCE_NAME}|" "$f" > /tmp/.omtmp 2>/dev/null || true
+      echo "$meta_line" >> /tmp/.omtmp
+      mv /tmp/.omtmp "$f"
+    fi
+    echo ""
+    print_success "Instance registered in Odoo Manager (~/docker/.odoo_manager_instances)"
+    print_info  "Run 'Odoo Manager.sh' on the destination server to manage it."
+  else
+    echo ""
+    print_info "Already registered in Odoo Manager."
+  fi
+
   print_line
   echo ""
 }
