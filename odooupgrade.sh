@@ -371,58 +371,72 @@ step_download_backup() {
   echo ""
 
   mkdir -p "$WORK_DIR"
-  rm -f "$WORK_DIR/${SRC_DB}_"*.zip 2>/dev/null || true
-  BACKUP_ZIP="$WORK_DIR/${SRC_DB}_$(date +%Y%m%d_%H%M%S).zip"
   EXTRACT_DIR="$WORK_DIR/${SRC_DB}_extract"
 
-  local _code_file="$WORK_DIR/.http_$$"
-  curl \
-    --connect-timeout 30 --max-time 7200 \
-    -w "%{http_code}" \
-    -o "$BACKUP_ZIP" \
-    --progress-bar \
-    -X POST "http://localhost:${SRC_PORT}/web/database/backup" \
-    -F "master_pwd=${SRC_MASTER_PASS}" \
-    -F "name=${SRC_DB}" \
-    -F "backup_format=zip" \
-    > "$_code_file" 2>/dev/null
-  echo ""
+  local _attempt _is_zip _code _sz
+  for _attempt in 1 2 3; do
+    rm -f "$WORK_DIR/${SRC_DB}_"*.zip 2>/dev/null || true
+    BACKUP_ZIP="$WORK_DIR/${SRC_DB}_$(date +%Y%m%d_%H%M%S).zip"
 
-  local _code; _code=$(cat "$_code_file" 2>/dev/null || echo "000")
-  rm -f "$_code_file"
-  _code="${_code//[^0-9]/}"
-
-  local sz; sz=$(du -sh "$BACKUP_ZIP" | cut -f1)
-
-  # Verify the response is actually a ZIP (magic bytes PK = 0x504B)
-  local _is_zip
-  _is_zip=$(python3 -c \
-    "f=open('${BACKUP_ZIP}','rb'); print('yes' if f.read(2)==b'PK' else 'no')" \
-    2>/dev/null || echo "no")
-
-  if [[ "$_code" != "200" || "$_is_zip" != "yes" ]]; then
-    # Show what Odoo actually returned (usually an error message)
-    local _err; _err=$(python3 -c \
-      "d=open('${BACKUP_ZIP}','rb').read(600); print(d.decode('utf-8','replace'))" \
-      2>/dev/null | grep -v '^$' | head -5 || true)
+    local _code_file="$WORK_DIR/.http_$$"
+    curl \
+      --connect-timeout 30 --max-time 7200 \
+      -w "%{http_code}" \
+      -o "$BACKUP_ZIP" \
+      --progress-bar \
+      -X POST "http://localhost:${SRC_PORT}/web/database/backup" \
+      -F "master_pwd=${SRC_MASTER_PASS}" \
+      -F "name=${SRC_DB}" \
+      -F "backup_format=zip" \
+      > "$_code_file" 2>/dev/null
     echo ""
-    print_error "Backup API returned HTTP ${_code:-000} — response is not a ZIP file (${sz})."
-    if [[ -n "$_err" ]]; then
-      print_warn "Server response:"
-      printf '%s\n' "$_err" | while IFS= read -r _l; do
-        echo -e "    ${YELLOW}${_l}${NC}"
-      done
+
+    _code=$(cat "$_code_file" 2>/dev/null || echo "000")
+    rm -f "$_code_file"
+    _code="${_code//[^0-9]/}"
+    _sz=$(du -sh "$BACKUP_ZIP" | cut -f1)
+
+    # Check magic bytes — a real ZIP starts with PK (0x504B)
+    _is_zip=$(python3 -c \
+      "f=open('${BACKUP_ZIP}','rb'); print('yes' if f.read(2)==b'PK' else 'no')" \
+      2>/dev/null || echo "no")
+
+    if [[ "$_is_zip" == "yes" ]]; then
+      print_success "Backup downloaded (${_sz})"
+      break
     fi
-    echo ""
-    print_info "Common causes:"
-    print_info "  • Wrong master password"
-    print_info "  • Database name '${SRC_DB}' does not exist on this Odoo instance"
-    print_info "  • Odoo is not reachable on port ${SRC_PORT}"
-    rm -f "$BACKUP_ZIP"
-    die "Backup download failed."
-  fi
 
-  print_success "Backup downloaded (${sz})"
+    # Extract Odoo's error text from the HTML response
+    local _odoo_err
+    _odoo_err=$(python3 -c "
+import re, sys
+html = open('${BACKUP_ZIP}', errors='replace').read()
+# Odoo wrong-password error appears in <p class='alert-danger'> or similar
+for pat in [r'alert-danger[^>]*>\s*([^<]{10,})', r'<p>([^<]{10,})</p>', r'<pre>([^<]+)</pre>']:
+    m = re.search(pat, html, re.S)
+    if m:
+        print(m.group(1).strip()[:200]); break
+" 2>/dev/null || true)
+
+    echo ""
+    print_error "Backup failed (HTTP ${_code:-000}, ${_sz}) — response is not a ZIP."
+    if [[ -n "$_odoo_err" ]]; then
+      print_warn "Odoo says: ${_odoo_err}"
+    fi
+    rm -f "$BACKUP_ZIP"
+
+    if [[ $_attempt -lt 3 ]]; then
+      echo ""
+      print_info "Retry ${_attempt}/3 — re-enter the master password:"
+      ask_secret "Master password" SRC_MASTER_PASS
+      [[ -z "$SRC_MASTER_PASS" ]] && die "Master password cannot be empty."
+    else
+      echo ""
+      print_info "Verify the correct master password with:"
+      print_info "  docker exec ${SRC_CONTAINER} grep admin_passwd /etc/odoo/odoo.conf"
+      die "Backup download failed after 3 attempts."
+    fi
+  done
 
   print_info "Extracting backup..."
   rm -rf "$EXTRACT_DIR"; mkdir -p "$EXTRACT_DIR"
