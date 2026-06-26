@@ -68,10 +68,13 @@ DST_VERSION=""      # target major version
 DST_INSTANCE=""     # new instance name  e.g. odoo9015
 DST_BASE_DIR=""     # directory for new instance
 DST_PORT=""         # web port for new instance
+DST_GEVENT_PORT=""  # longpolling port
 DST_PG_USER="odoo"
 DST_PG_PASS=""      # auto-generated
 DST_DB=""           # database name in new instance
 DST_MASTER_PASS=""  # Odoo master password for new instance
+
+ODOO_MANAGER_META="$HOME/docker/.odoo_manager_instances"
 
 ADDON_PY_DEPS=""
 WORK_DIR="$HOME/odoo_upgrade_work"
@@ -268,6 +271,13 @@ wizard() {
     print_error "Invalid port number."
   done
 
+  local _default_gevent; _default_gevent=$(_free_port "$((DST_PORT + 1))")
+  while true; do
+    ask "Gevent / longpolling port" "$_default_gevent" DST_GEVENT_PORT
+    [[ "$DST_GEVENT_PORT" =~ ^[0-9]+$ && "$DST_GEVENT_PORT" -ge 1 && "$DST_GEVENT_PORT" -le 65535 ]] && break
+    print_error "Invalid port number."
+  done
+
   ask "Database name" "${SRC_DB}" DST_DB
 
   echo ""
@@ -304,17 +314,19 @@ step_setup_files() {
 
   cat > "${DST_BASE_DIR}/config/odoo.conf" <<EOF
 [options]
-addons_path  = /mnt/extra-addons,/usr/lib/python3/dist-packages/odoo/addons
-db_host      = db
-db_port      = 5432
-db_user      = ${DST_PG_USER}
-db_password  = ${DST_PG_PASS}
-db_name      = ${DST_DB}
-admin_passwd = ${DST_MASTER_PASS}
-data_dir     = /var/lib/odoo
-logfile      = /var/log/odoo/odoo.log
-log_level    = warn
-workers      = 0
+addons_path       = /mnt/extra-addons,/usr/lib/python3/dist-packages/odoo/addons
+db_host           = db
+db_port           = 5432
+db_user           = ${DST_PG_USER}
+db_password       = ${DST_PG_PASS}
+db_name           = ${DST_DB}
+admin_passwd      = ${DST_MASTER_PASS}
+data_dir          = /var/lib/odoo
+logfile           = /var/log/odoo/odoo.log
+log_level         = warn
+workers           = 0
+longpolling_port  = ${DST_GEVENT_PORT}
+gevent_port       = ${DST_GEVENT_PORT}
 ${port_line}
 EOF
   print_success "odoo.conf written  (master password saved)"
@@ -339,6 +351,7 @@ services:
       - db
     ports:
       - "${DST_PORT}:8069"
+      - "${DST_GEVENT_PORT}:8072"
     volumes:
       - ./addons:/mnt/extra-addons
       - ./filestore:/var/lib/odoo
