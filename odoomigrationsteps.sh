@@ -1292,11 +1292,13 @@ step_start_odoo() {
   # Must run after container starts — pip3 needs the running container.
   if [[ -n "$ADDON_PY_DEPS" ]]; then
     print_info "Installing Python dependencies: ${ADDON_PY_DEPS}"
-    # Upgrade pip first — Odoo 14 image ships an old pip that can't parse
-    # modern pyproject.toml files (e.g. cryptography, required by paramiko).
+    # Use 'python3 -m pip' — guaranteed to install into the exact same
+    # Python that Odoo uses, regardless of which pip binary is in PATH.
+    # Upgrade pip first because Odoo 14 image ships an old pip that can't
+    # parse modern pyproject.toml (needed by cryptography/paramiko).
     dst "docker exec ${DST_INSTANCE_NAME}_odoo bash -c \
-      'pip3 install --upgrade pip setuptools --quiet && \
-       pip3 install ${ADDON_PY_DEPS}'" && \
+      'python3 -m pip install --upgrade pip setuptools --quiet && \
+       python3 -m pip install ${ADDON_PY_DEPS}'" && \
       print_success "Python dependencies installed" || \
       print_warn "pip install had errors — Odoo may fail to load some modules."
     print_info "Restarting Odoo to pick up new packages..."
