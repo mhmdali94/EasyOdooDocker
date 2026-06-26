@@ -1084,8 +1084,22 @@ step_restore_filestore() {
   if [[ "$DST_TYPE" == "remote" ]]; then
     print_info "Transferring filestore to ${DST_SSH_HOST}..."
     dst "mkdir -p '${DST_BASE_DIR}/filestore_import'"
-    # Transfer the filestore directory contents (trailing / on src = transfer contents)
-    dst_put "$EXTRACT_DIR/filestore" "${DST_BASE_DIR}/filestore_import"
+    # Use --info=progress2 instead of --progress so rsync prints ONE updating
+    # line for the whole transfer instead of a line per file (filestore has
+    # thousands of files and --progress floods the terminal).
+    local _opts; _opts=$(_ssh_base_opts)
+    if [[ "$DST_SSH_AUTH" == "password" ]]; then
+      sshpass -p "${DST_SSH_PASS}" \
+        rsync -az --info=progress2 \
+        -e "ssh $_opts -o BatchMode=no -o PasswordAuthentication=yes" \
+        "$EXTRACT_DIR/filestore" \
+        "${DST_SSH_USER}@${DST_SSH_HOST}:${DST_BASE_DIR}/filestore_import/"
+    else
+      rsync -az --info=progress2 \
+        -e "ssh -S '${DST_SSH_CTL}' -p ${DST_SSH_PORT}" \
+        "$EXTRACT_DIR/filestore" \
+        "${DST_SSH_USER}@${DST_SSH_HOST}:${DST_BASE_DIR}/filestore_import/"
+    fi
 
     print_info "Copying filestore into Docker volume..."
     dst "docker run --rm \
@@ -1207,11 +1221,11 @@ step_migrate_addons() {
     if [[ "$DST_TYPE" == "remote" ]]; then
       if [[ "$DST_SSH_AUTH" == "password" ]]; then
         sshpass -p "${DST_SSH_PASS}" \
-          rsync -az --progress \
+          rsync -az --info=progress2 \
           -e "ssh $_opts -o BatchMode=no -o PasswordAuthentication=yes" \
           "$_src" "${DST_SSH_USER}@${DST_SSH_HOST}:${DST_BASE_DIR}/addons/"
       else
-        rsync -az --progress \
+        rsync -az --info=progress2 \
           -e "ssh -S '${DST_SSH_CTL}' -p ${DST_SSH_PORT}" \
           "$_src" "${DST_SSH_USER}@${DST_SSH_HOST}:${DST_BASE_DIR}/addons/"
       fi
