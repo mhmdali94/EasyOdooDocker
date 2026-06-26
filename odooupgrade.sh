@@ -546,7 +546,7 @@ step_run_upgrade() {
     --entrypoint "" \
     odoo bash -c "
       python3 -m pip install --upgrade pip setuptools --quiet 2>/dev/null || true
-      python3 -m pip install --upgrade 'pyOpenSSL>=23.2.0' 'cryptography>=42.0.0' --quiet 2>/dev/null || true
+      python3 -m pip install 'cryptography<42.0' --force-reinstall --quiet 2>/dev/null || true
       ${ADDON_PY_DEPS:+python3 -m pip install ${ADDON_PY_DEPS} --quiet 2>/dev/null || true}
       exec odoo -d '${DST_DB}' -u all --stop-after-init --no-http --workers=0 --logfile=''
     "
@@ -575,7 +575,7 @@ step_start_odoo() {
   docker exec -u root "${DST_INSTANCE}_odoo" \
     python3 -m pip install --upgrade pip setuptools --quiet 2>/dev/null || true
   docker exec -u root "${DST_INSTANCE}_odoo" \
-    python3 -m pip install --upgrade 'pyOpenSSL>=23.2.0' 'cryptography>=42.0.0' --quiet 2>/dev/null || true
+    python3 -m pip install 'cryptography<42.0' --force-reinstall --quiet 2>/dev/null || true
 
   if [[ -n "$ADDON_PY_DEPS" ]]; then
     print_info "Installing manifest-declared packages: ${ADDON_PY_DEPS}"
