@@ -545,8 +545,8 @@ step_run_upgrade() {
   docker compose run --rm \
     --entrypoint "" \
     odoo bash -c "
+      rm -rf /usr/lib/python3/dist-packages/OpenSSL/ 2>/dev/null || true
       python3 -m pip install --upgrade pip setuptools --quiet 2>/dev/null || true
-      python3 -m pip install 'cryptography<37.0' --force-reinstall --quiet 2>/dev/null || true
       ${ADDON_PY_DEPS:+python3 -m pip install ${ADDON_PY_DEPS} --quiet 2>/dev/null || true}
       exec odoo -d '${DST_DB}' -u all --stop-after-init --no-http --workers=0 --logfile=''
     "
@@ -571,11 +571,11 @@ step_start_odoo() {
   cd "${DST_BASE_DIR}"
   docker compose up -d odoo
 
-  # Upgrade pip as root and fix pyOpenSSL/cryptography version conflict
+  # Remove conflicting system pyOpenSSL so pip's newer version takes over
+  docker exec -u root "${DST_INSTANCE}_odoo" \
+    bash -c "rm -rf /usr/lib/python3/dist-packages/OpenSSL/ 2>/dev/null; true"
   docker exec -u root "${DST_INSTANCE}_odoo" \
     python3 -m pip install --upgrade pip setuptools --quiet 2>/dev/null || true
-  docker exec -u root "${DST_INSTANCE}_odoo" \
-    python3 -m pip install 'cryptography<42.0' --force-reinstall --quiet 2>/dev/null || true
 
   if [[ -n "$ADDON_PY_DEPS" ]]; then
     print_info "Installing manifest-declared packages: ${ADDON_PY_DEPS}"
