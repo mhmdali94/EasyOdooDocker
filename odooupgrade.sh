@@ -616,6 +616,23 @@ step_start_odoo() {
     local ip; ip=$(hostname -I 2>/dev/null | awk '{print $1}' || echo "localhost")
     print_success "Odoo ${DST_VERSION} is live at  http://${ip}:${DST_PORT}"
     print_success "Source container (${SRC_CONTAINER}) was NOT modified."
+
+    # ── Register in Odoo Manager ──────────────────────────────────────────
+    if [[ -f "$ODOO_MANAGER_META" || -d "$(dirname "$ODOO_MANAGER_META")" ]]; then
+      mkdir -p "$(dirname "$ODOO_MANAGER_META")"
+      # Remove any stale entry with the same name, then append
+      sed -i "/^${DST_INSTANCE}|/d" "$ODOO_MANAGER_META" 2>/dev/null || true
+      echo "${DST_INSTANCE}|${DST_VERSION}|${DST_BASE_DIR}|${DST_PORT}|${DST_GEVENT_PORT}|${DST_PG_USER}|${DST_PG_PASS}|${DST_MASTER_PASS}|upgraded from ${SRC_CONTAINER}" \
+        >> "$ODOO_MANAGER_META"
+      print_success "Registered in Odoo Manager  (${ODOO_MANAGER_META})"
+    else
+      print_info "Odoo Manager meta file not found — creating it."
+      mkdir -p "$(dirname "$ODOO_MANAGER_META")"
+      echo "${DST_INSTANCE}|${DST_VERSION}|${DST_BASE_DIR}|${DST_PORT}|${DST_GEVENT_PORT}|${DST_PG_USER}|${DST_PG_PASS}|${DST_MASTER_PASS}|upgraded from ${SRC_CONTAINER}" \
+        >> "$ODOO_MANAGER_META"
+      print_success "Registered in Odoo Manager  (${ODOO_MANAGER_META})"
+    fi
+
     echo ""
     print_info "Next steps:"
     print_info "  1. Log in and verify your data"
