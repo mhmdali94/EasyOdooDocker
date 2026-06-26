@@ -470,7 +470,7 @@ step_restore_db() {
   print_info "Restoring database dump (this may take several minutes)..."
   docker exec -i "${DST_INSTANCE}_db" \
     psql -q -U "${DST_PG_USER}" -d "${DST_DB}" \
-    < "$DUMP_FILE" 2>&1 | grep -vE '^(SET|COMMENT|CREATE|ALTER|INSERT|UPDATE|COPY|SELECT|DELETE|GRANT|REVOKE|SEQUENCE|TABLE|INDEX|TRIGGER|FUNCTION|PROCEDURE|TYPE|SCHEMA|EXTENSION|AGGREGATE| set_config|-+|\([0-9]+ row)' \
+    < "$DUMP_FILE" 2>&1 | grep -vE '^(SET|COMMENT|CREATE|ALTER|INSERT|UPDATE|COPY|SELECT|DELETE|GRANT|REVOKE|SEQUENCE|TABLE|INDEX|TRIGGER|FUNCTION|PROCEDURE|TYPE|SCHEMA|EXTENSION|AGGREGATE| set_config| setval|-+|\([0-9]+ row)' \
     || print_warn "psql had warnings (usually harmless). Continuing."
   print_success "Database restored"
 }
@@ -546,7 +546,7 @@ step_run_upgrade() {
     --entrypoint "" \
     odoo bash -c "
       python3 -m pip install --upgrade pip setuptools --quiet 2>/dev/null || true
-      python3 -m pip install 'cryptography<42.0' --force-reinstall --quiet 2>/dev/null || true
+      python3 -m pip install 'cryptography<37.0' --force-reinstall --quiet 2>/dev/null || true
       ${ADDON_PY_DEPS:+python3 -m pip install ${ADDON_PY_DEPS} --quiet 2>/dev/null || true}
       exec odoo -d '${DST_DB}' -u all --stop-after-init --no-http --workers=0 --logfile=''
     "
