@@ -21,15 +21,16 @@ fi
 #            Can be this machine (local) or a remote server (SSH).
 #
 #   Steps:
-#     1. Configure source  (URL + master password + pick DB)
-#     2. Configure target  (local Docker or remote SSH)
-#     3. Download backup   (POST /web/database/backup → zip file)
-#     4. Extract backup    (dump.sql + filestore/)
-#     5. Create Docker     (PostgreSQL 13 + Odoo 14 containers)
-#     6. Restore database  (psql < dump.sql into pg container)
-#     7. Restore filestore (copy into Docker volume)
-#     8. Start Odoo        (bring up the web container)
-#     9. Verify            (HTTP check + container status)
+#     1.  Configure source   (URL + master password + pick DB)
+#     2.  Configure target   (local Docker or remote SSH)
+#     3.  Download backup    (POST /web/database/backup → zip file)
+#     4.  Extract backup     (dump.sql + filestore/)
+#     5.  Create Docker      (PostgreSQL 13 + Odoo 14 containers)
+#     6.  Restore database   (psql < dump.sql into pg container)
+#     7.  Restore filestore  (copy into Docker volume)
+#     8.  Migrate addons     (copy third-party addons from source)
+#     9.  Start Odoo         (bring up the web container)
+#     10. Verify             (HTTP check + container status)
 #
 #   Author:  Mohammed Ali
 #   Website: https://prismatechwork.com
@@ -266,7 +267,7 @@ check_deps() {
 # ── Auto-detect running Odoo (read-only, no changes) ─────────
 #
 # Populates globals: ODOO_CONF_PATH, SRC_DB_HINT,
-#                    SRC_PASS_HINT, SRC_PORT_HINT
+#                    SRC_PASS_HINT, SRC_PORT_HINT, ODOO_ADDONS_HINT
 #
 # Every command here uses || true so a detection failure never
 # crashes the script — all values gracefully fall back to "".
@@ -276,6 +277,7 @@ _detect_local_odoo() {
   SRC_DB_HINT=""
   SRC_PASS_HINT=""
   SRC_PORT_HINT=""
+  ODOO_ADDONS_HINT=""
 
   # ── 1. Find odoo.conf ──────────────────────────────────────
   local conf=""
@@ -341,9 +343,28 @@ _detect_local_odoo() {
     if [ -n "$port" ] && echo "$port" | grep -qE '^[0-9]+$'; then
       SRC_PORT_HINT="$port"
     fi
+
+    # addons_path — read the raw comma-separated value; step_migrate_addons will parse it
+    local ap
+    ap=$(grep -E '^[[:space:]]*addons_path[[:space:]]*=' "$conf" 2>/dev/null \
+         | head -1 \
+         | sed 's/^[^=]*=[[:space:]]*//' \
+         | tr -d '\r') || ap=""
+    [ -n "$ap" ] && ODOO_ADDONS_HINT="$ap"
   fi
 
-  # ── 3. Detect port from running process args ───────────────
+  # ── 3. Detect addons_path from running process args ────────
+  if [ -z "$ODOO_ADDONS_HINT" ]; then
+    local proc_addons
+    proc_addons=$(ps aux 2>/dev/null \
+      | grep -E 'odoo-bin|odoo\.py' \
+      | grep -v grep \
+      | sed -n 's/.*--addons-path[= ]\([^ ]*\).*/\1/p' \
+      | head -1) || proc_addons=""
+    [ -n "$proc_addons" ] && ODOO_ADDONS_HINT="$proc_addons"
+  fi
+
+  # ── 5. Detect port from running process args ───────────────
   if [ -z "$SRC_PORT_HINT" ]; then
     local proc_port
     proc_port=$(ps aux 2>/dev/null \
@@ -357,7 +378,7 @@ _detect_local_odoo() {
     fi
   fi
 
-  # ── 4. Live-probe common ports ─────────────────────────────
+  # ── 6. Live-probe common ports ─────────────────────────────
   if [ -z "$SRC_PORT_HINT" ]; then
     local p code
     for p in 8069 8070 8071 8072; do
@@ -370,7 +391,7 @@ _detect_local_odoo() {
     done
   fi
 
-  # ── 5. Final fallback ──────────────────────────────────────
+  # ── 7. Final fallback ──────────────────────────────────────
   if [ -z "$SRC_PORT_HINT" ]; then
     SRC_PORT_HINT="8069"
   fi
@@ -378,7 +399,7 @@ _detect_local_odoo() {
 
 # ── STEP 1: Source configuration ─────────────────────────────
 step_source() {
-  print_step "Step 1 of 9 — Configure source (production server)"
+  print_step "Step 1 of 10 — Configure source (production server)"
   print_line
   print_info "Running ON this Odoo server — detecting configuration..."
   echo ""
@@ -393,8 +414,9 @@ step_source() {
     print_warn "No odoo.conf found — will use manual values."
   fi
   print_success "Odoo port detected: ${SRC_PORT_HINT}"
-  [[ -n "$SRC_DB_HINT"   ]] && print_success "Database detected: ${SRC_DB_HINT}"
-  [[ -n "$SRC_PASS_HINT" ]] && print_success "Master password:   (read from conf)"
+  [[ -n "$SRC_DB_HINT"      ]] && print_success "Database detected:    ${SRC_DB_HINT}"
+  [[ -n "$SRC_PASS_HINT"   ]] && print_success "Master password:      (read from conf)"
+  [[ -n "$ODOO_ADDONS_HINT" ]] && print_success "addons_path detected: ${ODOO_ADDONS_HINT}"
   echo ""
 
   # ── Build and confirm the source URL ──────────────────────
@@ -484,7 +506,7 @@ step_source() {
 
 # ── STEP 2: Destination configuration ────────────────────────
 step_destination() {
-  print_step "Step 2 of 9 — Configure destination"
+  print_step "Step 2 of 10 — Configure destination"
   print_line
   echo ""
 
@@ -606,7 +628,7 @@ step_destination() {
 
 # ── STEP 3: Download backup from source ──────────────────────
 step_download() {
-  print_step "Step 3 of 9 — Download backup from production (read-only)"
+  print_step "Step 3 of 10 — Download backup from production (read-only)"
   print_line
   print_info "Calling POST /web/database/backup on source."
   print_info "This only reads the database — nothing is modified on prod."
@@ -694,7 +716,7 @@ step_download() {
 
 # ── STEP 4: Extract backup ────────────────────────────────────
 step_extract() {
-  print_step "Step 4 of 9 — Extract backup"
+  print_step "Step 4 of 10 — Extract backup"
   print_line
 
   EXTRACT_DIR="${BACKUP_ZIP%.zip}"
@@ -725,7 +747,7 @@ step_extract() {
 
 # ── STEP 5: Create Docker instance ───────────────────────────
 step_create_docker() {
-  print_step "Step 5 of 9 — Create Docker Odoo 14 instance on destination"
+  print_step "Step 5 of 10 — Create Docker Odoo 14 instance on destination"
   print_line
 
   # ── Install Docker on remote if missing ───────────────────
@@ -880,7 +902,7 @@ step_create_docker() {
 
 # ── STEP 6: Restore database ──────────────────────────────────
 step_restore_db() {
-  print_step "Step 6 of 9 — Restore database into Docker PostgreSQL"
+  print_step "Step 6 of 10 — Restore database into Docker PostgreSQL"
   print_line
 
   local dump="$EXTRACT_DIR/dump.sql"
@@ -978,7 +1000,7 @@ step_restore_db() {
 
 # ── STEP 7: Restore filestore ─────────────────────────────────
 step_restore_filestore() {
-  print_step "Step 7 of 9 — Restore filestore"
+  print_step "Step 7 of 10 — Restore filestore"
   print_line
 
   if [[ ! -d "$EXTRACT_DIR/filestore" ]]; then
@@ -1022,9 +1044,117 @@ step_restore_filestore() {
   print_success "Filestore restored to volume at filestore/${DST_DB}/"
 }
 
-# ── STEP 8: Start Odoo container ──────────────────────────────
+# ── STEP 8: Migrate custom addons ────────────────────────────
+_is_standard_odoo_path() {
+  local p="$1"
+  [[ "$p" == */dist-packages/odoo/addons* ]] && return 0
+  [[ "$p" == */site-packages/odoo/addons* ]] && return 0
+  [[ "$p" == /usr/lib/python3*            ]] && return 0
+  [[ "$p" == /usr/local/lib/python3*      ]] && return 0
+  return 1
+}
+
+step_migrate_addons() {
+  print_step "Step 8 of 10 — Migrate custom addons from source server"
+  print_line
+  echo ""
+
+  # ── 1. Build the raw addons_path string ───────────────────
+  # Priority: auto-detected from conf/process → ask user
+  local addons_path_raw="$ODOO_ADDONS_HINT"
+
+  if [[ -n "$addons_path_raw" ]]; then
+    print_success "addons_path detected: $addons_path_raw"
+  else
+    print_warn "Could not auto-detect addons_path from odoo.conf or process args."
+    echo ""
+    echo -e "  Enter the comma-separated addons_path from your odoo.conf."
+    echo -e "  Example: ${GRAY}/opt/odoo/addons,/opt/odoo/custom/addons${NC}"
+    echo -e "  Press Enter with no value to skip (no custom addons)."
+    echo ""
+    ask "addons_path" "" addons_path_raw
+    if [[ -z "$addons_path_raw" ]]; then
+      print_warn "Skipped. If Odoo shows CSS/module errors after start, re-run with:"
+      print_info "  rsync -az /your/custom/addons/ user@host:${DST_BASE_DIR}/addons/"
+      return 0
+    fi
+  fi
+
+  # ── 2. Parse and filter to custom paths only ──────────────
+  local -a custom_paths=()
+  local _p
+  while IFS= read -r _p; do
+    _p="${_p#"${_p%%[![:space:]]*}"}"   # ltrim
+    _p="${_p%"${_p##*[![:space:]]}"}"   # rtrim
+    [[ -z "$_p" ]]              && continue
+    _is_standard_odoo_path "$_p" && continue
+    [[ ! -d "$_p" ]] && {
+      print_warn "Path does not exist, skipping: $_p"
+      continue
+    }
+    custom_paths+=("$_p")
+  done < <(echo "$addons_path_raw" | tr ',' '\n')
+
+  if [[ ${#custom_paths[@]} -eq 0 ]]; then
+    print_warn "No custom addons paths found after filtering standard Odoo paths."
+    return 0
+  fi
+
+  # ── 3. Show what will be copied ───────────────────────────
+  echo ""
+  echo -e "  ${WHITE}Custom addons to migrate:${NC}"
+  echo ""
+  local total_count=0
+  for _p in "${custom_paths[@]}"; do
+    local _count
+    _count=$(find "$_p" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l | tr -d ' ')
+    echo -e "    ${CYAN}${_p}${NC}  →  ${_count} addon(s)"
+    ((total_count += _count))
+  done
+  echo ""
+
+  if [[ $total_count -eq 0 ]]; then
+    print_warn "Custom paths found but they are all empty — skipping."
+    return 0
+  fi
+
+  # Default answer is yes — this is required for a complete migration
+  local ans
+  ask "Copy all ${total_count} addon(s) to the Docker instance?" "y" ans
+  if [[ "${ans,,}" != "y" ]]; then
+    print_warn "Skipped. Copy addons manually before starting Odoo:"
+    print_info "  rsync -az /your/custom/addons/ ${DST_SSH_USER:-user}@${DST_SSH_HOST:-host}:${DST_BASE_DIR}/addons/"
+    return 0
+  fi
+
+  # ── 4. rsync each custom path's contents to destination ───
+  local _opts; _opts=$(_ssh_base_opts)
+  for _p in "${custom_paths[@]}"; do
+    local _src="${_p%/}/"   # trailing slash: copy contents, not the dir wrapper
+    print_info "Syncing: ${_p}  →  ${DST_BASE_DIR}/addons/"
+    if [[ "$DST_TYPE" == "remote" ]]; then
+      if [[ "$DST_SSH_AUTH" == "password" ]]; then
+        sshpass -p "${DST_SSH_PASS}" \
+          rsync -az --progress \
+          -e "ssh $_opts -o BatchMode=no -o PasswordAuthentication=yes" \
+          "$_src" "${DST_SSH_USER}@${DST_SSH_HOST}:${DST_BASE_DIR}/addons/"
+      else
+        rsync -az --progress \
+          -e "ssh -S '${DST_SSH_CTL}' -p ${DST_SSH_PORT}" \
+          "$_src" "${DST_SSH_USER}@${DST_SSH_HOST}:${DST_BASE_DIR}/addons/"
+      fi
+    else
+      rsync -a "$_src" "${DST_BASE_DIR}/addons/"
+    fi
+    print_success "Done: ${_p}"
+  done
+
+  print_success "All ${total_count} custom addon(s) installed at ${DST_BASE_DIR}/addons/"
+}
+
+# ── STEP 9: Start Odoo container ──────────────────────────────
 step_start_odoo() {
-  print_step "Step 8 of 9 — Start Odoo 14 container"
+  print_step "Step 9 of 10 — Start Odoo 14 container"
   print_line
 
   dst "cd '${DST_BASE_DIR}' && docker compose up -d odoo"
@@ -1068,7 +1198,7 @@ step_start_odoo() {
 
 # ── STEP 9: Verify ────────────────────────────────────────────
 step_verify() {
-  print_step "Step 9 of 9 — Verify migration"
+  print_step "Step 10 of 10 — Verify migration"
   print_line
 
   local check_host
@@ -1207,8 +1337,9 @@ main() {
   step_create_docker     # 5. Create containers, start DB only
   step_restore_db        # 6. psql < dump.sql
   step_restore_filestore # 7. copy filestore into volume
-  step_start_odoo        # 8. bring up Odoo container
-  step_verify            # 9. HTTP + container check
+  step_migrate_addons    # 8. copy third-party addons from source
+  step_start_odoo        # 9. bring up Odoo container
+  step_verify            # 10. HTTP + container check
 
   print_summary
 
