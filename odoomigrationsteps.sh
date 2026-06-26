@@ -285,10 +285,19 @@ _detect_local_odoo() {
   for candidate in \
       /etc/odoo/odoo.conf \
       /etc/odoo.conf \
+      /etc/odoo-server.conf \
+      /etc/odoo14.conf \
+      /etc/odoo14-server.conf \
+      /etc/odoo15.conf \
+      /etc/odoo16.conf \
+      /etc/odoo17.conf \
       /opt/odoo/odoo.conf \
       /opt/odoo/conf/odoo.conf \
       /home/odoo/odoo.conf \
       /home/odoo/conf/odoo.conf \
+      /odoo/odoo.conf \
+      /odoo/conf/odoo.conf \
+      /odoo/odoo-server/odoo.conf \
       /usr/lib/python3/dist-packages/odoo/odoo.conf
   do
     if [ -f "$candidate" ]; then
@@ -298,17 +307,23 @@ _detect_local_odoo() {
   done
 
   # If not found via fixed paths, try reading from the running process args
-  # (uses only POSIX grep -E + sed — no Perl regex needed)
   if [ -z "$conf" ]; then
     local proc_conf
     proc_conf=$(ps aux 2>/dev/null \
-      | grep -E 'odoo-bin|odoo\.py' \
+      | grep -E 'odoo-bin|odoo\.py|odoo-server' \
       | grep -v grep \
-      | sed -n 's/.*--config[= ]\([^ ]*\).*/\1/p' \
+      | sed -n 's/.*-c[= ]\([^ ]*\.conf\).*/\1/p;s/.*--config[= ]\([^ ]*\).*/\1/p' \
       | head -1) || proc_conf=""
     if [ -n "$proc_conf" ] && [ -f "$proc_conf" ]; then
       conf="$proc_conf"
     fi
+  fi
+
+  # Last resort: search /etc for any .conf containing addons_path
+  if [ -z "$conf" ]; then
+    conf=$(find /etc -maxdepth 3 -name "*.conf" 2>/dev/null \
+      | xargs grep -l "addons_path" 2>/dev/null \
+      | head -1) || conf=""
   fi
 
   # ── 2. Read values from the conf file (all with || true) ───
@@ -372,11 +387,13 @@ _detect_local_odoo() {
     local _found_dirs=""
     local _root
     for _root in \
+        /odoo /odoo/custom /odoo/home \
         /opt/odoo /opt/odoo14 /opt/odoo-server /opt/odoo-ce \
         /home/odoo /home/odoo14 \
         /srv/odoo \
         /root/odoo \
-        /var/lib/odoo
+        /var/lib/odoo \
+        /odoo/odoo-server
     do
       [ -d "$_root" ] || continue
       # Find __manifest__.py files up to depth 6, skip .git and dist-packages
@@ -1103,6 +1120,9 @@ _is_standard_odoo_path() {
   [[ "$p" == */site-packages/odoo/addons* ]] && return 0
   [[ "$p" == /usr/lib/python3*            ]] && return 0
   [[ "$p" == /usr/local/lib/python3*      ]] && return 0
+  # Core Odoo source tree addons (built into Docker image, don't copy)
+  [[ "$p" == */odoo-server/addons         ]] && return 0
+  [[ "$p" == */odoo-server/addons/        ]] && return 0
   return 1
 }
 
