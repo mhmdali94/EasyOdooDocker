@@ -1288,37 +1288,81 @@ step_start_odoo() {
 
   dst "cd '${DST_BASE_DIR}' && docker compose up -d odoo"
 
-  # Install Python deps declared by custom addons (collected in step 8).
-  # Must run after container starts — pip3 needs the running container.
+  # Upgrade pip once so subsequent installs can handle modern pyproject.toml.
+  # -u root: packages land in /usr/local/lib/pythonX/dist-packages/ (always
+  # importable) rather than odoo user's ~/.local inside the filestore volume.
+  dst "docker exec -u root ${DST_INSTANCE_NAME}_odoo \
+    python3 -m pip install --upgrade pip setuptools --quiet" 2>/dev/null || true
+
+  # Install Python deps declared in addon manifests (collected in step 8).
   if [[ -n "$ADDON_PY_DEPS" ]]; then
-    print_info "Installing Python dependencies: ${ADDON_PY_DEPS}"
-    # Use 'python3 -m pip' — guaranteed to install into the exact same
-    # Python that Odoo uses, regardless of which pip binary is in PATH.
-    # Upgrade pip first because Odoo 14 image ships an old pip that can't
-    # parse modern pyproject.toml (needed by cryptography/paramiko).
-    # -u root: ensures packages land in /usr/local/lib/pythonX/dist-packages/
-    # (system path, always importable) rather than odoo user's ~/.local which
-    # can be excluded by PYTHONNOUSERSITE or sit inside the filestore volume.
-    dst "docker exec -u root ${DST_INSTANCE_NAME}_odoo bash -c \
-      'python3 -m pip install --upgrade pip setuptools --quiet && \
-       python3 -m pip install ${ADDON_PY_DEPS}'"
-    local pip_rc=$?
-    if [[ $pip_rc -eq 0 ]]; then
-      # Verify imports actually work before declaring success
-      local verify_imports=""
-      for _dep in $ADDON_PY_DEPS; do
-        verify_imports+="import ${_dep}; "
-      done
-      if dst "docker exec -u root ${DST_INSTANCE_NAME}_odoo python3 -c '${verify_imports}print(\"OK\")'"; then
-        print_success "Python dependencies installed and verified"
-      else
-        print_warn "pip reported success but some imports still fail — check package names match Python module names"
-      fi
-    else
-      print_warn "pip install had errors — Odoo may fail to load some modules."
+    print_info "Installing manifest-declared packages: ${ADDON_PY_DEPS}"
+    dst "docker exec -u root ${DST_INSTANCE_NAME}_odoo \
+      python3 -m pip install ${ADDON_PY_DEPS} --quiet" \
+      && print_success "Manifest packages installed" \
+      || print_warn "pip had errors on manifest packages — continuing"
+  fi
+
+  # Auto-fix loop: some addons have undeclared Python deps and raise
+  # ImportError at load time. Detect them from Odoo's log and install
+  # automatically, up to 5 rounds.
+  print_info "Starting Odoo — will auto-fix any missing Python packages..."
+  local _attempt _fixed_pkgs="" _odoo_ok=false
+  for _attempt in 1 2 3 4 5; do
+    # Clear log so we only see errors from THIS boot, then restart
+    dst "docker exec -u root ${DST_INSTANCE_NAME}_odoo \
+      truncate -s0 /var/log/odoo/odoo.log" 2>/dev/null || true
+    dst "docker restart ${DST_INSTANCE_NAME}_odoo" >/dev/null
+    sleep 20  # give Odoo time to attempt module loading and hit any ImportErrors
+
+    # Quick HTTP check — 200/302/303 means Odoo is up
+    local _code
+    _code=$(dst "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 \
+      'http://127.0.0.1:${DST_WEB_PORT}/web/login'" 2>/dev/null | tr -cd '0-9' || echo "000")
+    if [[ "$_code" == "200" || "$_code" == "302" || "$_code" == "303" ]]; then
+      _odoo_ok=true
+      print_success "Odoo is up (attempt ${_attempt})"
+      break
     fi
-    print_info "Restarting Odoo to pick up new packages..."
-    dst "docker restart ${DST_INSTANCE_NAME}_odoo"
+
+    # Parse log for missing package names using two patterns:
+    #   1. Standard Python: No module named 'X'  (may be 'X.Y' — use top-level X)
+    #   2. Custom messages: "pip[3] install X"
+    local _log
+    _log=$(dst "docker exec ${DST_INSTANCE_NAME}_odoo \
+      tail -150 /var/log/odoo/odoo.log 2>/dev/null" 2>/dev/null || true)
+
+    local _from_no_module _from_pip_hint _new_pkgs
+    _from_no_module=$(printf '%s\n' "$_log" \
+      | grep -oE "No module named '[^']+'" \
+      | grep -oE "'[^']+'" | tr -d "'" \
+      | sed 's/\..*//' | sort -u)
+    _from_pip_hint=$(printf '%s\n' "$_log" \
+      | grep -iE "pip3? install [a-zA-Z0-9_-]+" \
+      | grep -oE "install [a-zA-Z0-9_-]+" | awk '{print $2}' | sort -u)
+
+    _new_pkgs=$(printf '%s\n%s\n' "$_from_no_module" "$_from_pip_hint" \
+      | sort -u | grep -v '^$' \
+      | grep -vFx "$(printf '%s\n' $_fixed_pkgs)" \
+      | tr '\n' ' ' | sed 's/ $//')
+
+    if [[ -z "$_new_pkgs" ]]; then
+      print_warn "Odoo not responding (attempt ${_attempt}) — no new ImportErrors in log"
+      break
+    fi
+
+    print_info "Attempt ${_attempt}: detected missing packages: ${_new_pkgs}"
+    dst "docker exec -u root ${DST_INSTANCE_NAME}_odoo \
+      python3 -m pip install ${_new_pkgs} --quiet" \
+      && print_success "Installed: ${_new_pkgs}" \
+      || print_warn "pip install failed for: ${_new_pkgs}"
+    _fixed_pkgs="${_fixed_pkgs} ${_new_pkgs}"
+  done
+
+  if [[ "$_odoo_ok" == false ]]; then
+    print_warn "Odoo did not respond after ${_attempt} attempt(s)."
+    print_info "Check logs: docker exec ${DST_INSTANCE_NAME}_odoo tail -50 /var/log/odoo/odoo.log"
+    return 0
   fi
 
   local check_host
@@ -1327,34 +1371,6 @@ step_start_odoo() {
   else
     check_host="127.0.0.1"
   fi
-
-  # Poll from the DESTINATION machine so firewall rules between source and dest don't interfere.
-  print_info "Waiting for Odoo to respond on port ${DST_WEB_PORT}..."
-  local waited=0
-  while true; do
-    local code
-    if [[ "$DST_TYPE" == "remote" ]]; then
-      code=$(dst "curl -s -o /dev/null -w '%{http_code}' --connect-timeout 5 \
-        'http://127.0.0.1:${DST_WEB_PORT}/web/login'" 2>/dev/null || echo "000")
-    else
-      code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 \
-        "http://127.0.0.1:${DST_WEB_PORT}/web/login" 2>/dev/null || echo "000")
-    fi
-    code="${code//[^0-9]/}"
-    case "$code" in
-      200|302|303)
-        break ;;
-    esac
-    sleep 4
-    ((waited += 4))
-    if [[ $waited -ge 120 ]]; then
-      print_warn "Odoo has not responded after 2 min — it may still be starting."
-      print_info "Check logs: docker exec ${DST_INSTANCE_NAME}_odoo tail -30 /var/log/odoo/odoo.log"
-      return 0
-    fi
-    printf "."
-  done
-  echo ""
   print_success "Odoo is responding at http://${check_host}:${DST_WEB_PORT}"
 }
 
