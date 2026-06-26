@@ -364,7 +364,59 @@ _detect_local_odoo() {
     [ -n "$proc_addons" ] && ODOO_ADDONS_HINT="$proc_addons"
   fi
 
-  # ── 5. Detect port from running process args ───────────────
+  # ── 4. Search filesystem for __manifest__.py files ─────────
+  # When neither the conf file nor process args reveal the addons path,
+  # find it by locating Odoo module directories (they always contain
+  # __manifest__.py). The parent of those dirs is the addons directory.
+  if [ -z "$ODOO_ADDONS_HINT" ]; then
+    local _found_dirs=""
+    local _root
+    for _root in \
+        /opt/odoo /opt/odoo14 /opt/odoo-server /opt/odoo-ce \
+        /home/odoo /home/odoo14 \
+        /srv/odoo \
+        /root/odoo \
+        /var/lib/odoo
+    do
+      [ -d "$_root" ] || continue
+      # Find __manifest__.py files up to depth 6, skip .git and dist-packages
+      local _hits
+      _hits=$(find "$_root" -maxdepth 6 -name "__manifest__.py" \
+        -not -path "*/.git/*" \
+        -not -path "*/dist-packages/*" \
+        -not -path "*/site-packages/*" \
+        2>/dev/null | head -30) || continue
+      [ -z "$_hits" ] && continue
+      # Each manifest is at <addons_dir>/<module>/__manifest__.py
+      # so dirname twice gives the addons_dir
+      local _dirs
+      _dirs=$(printf '%s\n' "$_hits" | while IFS= read -r _m; do
+        _mod="$(dirname "$_m")"
+        dirname "$_mod"
+      done | sort -u)
+      [ -n "$_dirs" ] && _found_dirs=$(printf '%s\n%s' "$_found_dirs" "$_dirs")
+    done
+    if [ -n "$_found_dirs" ]; then
+      # Build comma-separated list of unique non-standard paths
+      local _unique_custom
+      _unique_custom=$(printf '%s\n' "$_found_dirs" \
+        | grep -v '^$' \
+        | sort -u \
+        | while IFS= read -r _d; do
+            case "$_d" in
+              */dist-packages/odoo/addons*) ;;
+              */site-packages/odoo/addons*) ;;
+              /usr/lib/python3*)            ;;
+              /usr/local/lib/python3*)      ;;
+              *) echo "$_d" ;;
+            esac
+          done \
+        | tr '\n' ',' | sed 's/,$//')
+      [ -n "$_unique_custom" ] && ODOO_ADDONS_HINT="$_unique_custom"
+    fi
+  fi
+
+  # ── 6. Detect port from running process args ───────────────
   if [ -z "$SRC_PORT_HINT" ]; then
     local proc_port
     proc_port=$(ps aux 2>/dev/null \
@@ -378,7 +430,7 @@ _detect_local_odoo() {
     fi
   fi
 
-  # ── 6. Live-probe common ports ─────────────────────────────
+  # ── 7. Live-probe common ports ─────────────────────────────
   if [ -z "$SRC_PORT_HINT" ]; then
     local p code
     for p in 8069 8070 8071 8072; do
@@ -391,7 +443,7 @@ _detect_local_odoo() {
     done
   fi
 
-  # ── 7. Final fallback ──────────────────────────────────────
+  # ── 8. Final fallback ──────────────────────────────────────
   if [ -z "$SRC_PORT_HINT" ]; then
     SRC_PORT_HINT="8069"
   fi
