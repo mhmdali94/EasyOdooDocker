@@ -1296,11 +1296,27 @@ step_start_odoo() {
     # Python that Odoo uses, regardless of which pip binary is in PATH.
     # Upgrade pip first because Odoo 14 image ships an old pip that can't
     # parse modern pyproject.toml (needed by cryptography/paramiko).
-    dst "docker exec ${DST_INSTANCE_NAME}_odoo bash -c \
+    # -u root: ensures packages land in /usr/local/lib/pythonX/dist-packages/
+    # (system path, always importable) rather than odoo user's ~/.local which
+    # can be excluded by PYTHONNOUSERSITE or sit inside the filestore volume.
+    dst "docker exec -u root ${DST_INSTANCE_NAME}_odoo bash -c \
       'python3 -m pip install --upgrade pip setuptools --quiet && \
-       python3 -m pip install ${ADDON_PY_DEPS}'" && \
-      print_success "Python dependencies installed" || \
+       python3 -m pip install ${ADDON_PY_DEPS}'"
+    local pip_rc=$?
+    if [[ $pip_rc -eq 0 ]]; then
+      # Verify imports actually work before declaring success
+      local verify_imports=""
+      for _dep in $ADDON_PY_DEPS; do
+        verify_imports+="import ${_dep}; "
+      done
+      if dst "docker exec -u root ${DST_INSTANCE_NAME}_odoo python3 -c '${verify_imports}print(\"OK\")'"; then
+        print_success "Python dependencies installed and verified"
+      else
+        print_warn "pip reported success but some imports still fail — check package names match Python module names"
+      fi
+    else
       print_warn "pip install had errors — Odoo may fail to load some modules."
+    fi
     print_info "Restarting Odoo to pick up new packages..."
     dst "docker restart ${DST_INSTANCE_NAME}_odoo"
   fi
