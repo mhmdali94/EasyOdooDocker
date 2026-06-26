@@ -887,8 +887,6 @@ step_create_docker() {
   print_info "Writing docker-compose.yml..."
   local compose
   compose=$(printf '%s\n' \
-    "version: '3.8'" \
-    '' \
     'services:' \
     '' \
     '  db:' \
@@ -1166,19 +1164,22 @@ step_migrate_addons() {
     fi
   fi
 
-  # ── 2. Parse and filter to custom paths only ──────────────
+  # ── 2. Parse, deduplicate, and filter to custom paths only ──
   local -a custom_paths=()
-  local _p
+  local _p _seen=""
   while IFS= read -r _p; do
     _p="${_p#"${_p%%[![:space:]]*}"}"   # ltrim
     _p="${_p%"${_p##*[![:space:]]}"}"   # rtrim
     [[ -z "$_p" ]]              && continue
     _is_standard_odoo_path "$_p" && continue
+    # Skip duplicates
+    echo "$_seen" | grep -qxF "$_p"    && continue
     [[ ! -d "$_p" ]] && {
       print_warn "Path does not exist, skipping: $_p"
       continue
     }
     custom_paths+=("$_p")
+    _seen="${_seen}"$'\n'"${_p}"
   done < <(echo "$addons_path_raw" | tr ',' '\n')
 
   if [[ ${#custom_paths[@]} -eq 0 ]]; then
@@ -1236,6 +1237,72 @@ step_migrate_addons() {
   done
 
   print_success "All ${total_count} custom addon(s) installed at ${DST_BASE_DIR}/addons/"
+
+  # ── 5. Scan manifests for Python dependencies ─────────────
+  # Some custom modules declare external Python libs in __manifest__.py
+  # under 'external_dependencies': {'python': ['paramiko', ...]}.
+  # Collect them all and install into the Odoo container before start.
+  print_info "Scanning addons for Python dependencies..."
+  local _py_deps
+  _py_deps=$(python3 - "${DST_BASE_DIR}/addons" <<'PYEOF'
+import sys, ast, glob, os
+
+addons_dir = sys.argv[1]
+deps = set()
+for manifest_path in glob.glob(os.path.join(addons_dir, '*', '__manifest__.py')):
+    try:
+        with open(manifest_path, 'r', errors='ignore') as f:
+            content = f.read()
+        m = ast.literal_eval(content)
+        for pkg in m.get('external_dependencies', {}).get('python', []):
+            if pkg and isinstance(pkg, str):
+                deps.add(pkg)
+    except Exception:
+        pass
+print('\n'.join(sorted(deps)))
+PYEOF
+  ) 2>/dev/null || _py_deps=""
+
+  # Also scan any local custom paths (before they were copied to destination)
+  for _p in "${custom_paths[@]}"; do
+    local _more
+    _more=$(python3 - "$_p" <<'PYEOF'
+import sys, ast, glob, os
+
+addons_dir = sys.argv[1]
+deps = set()
+for manifest_path in glob.glob(os.path.join(addons_dir, '*', '__manifest__.py')):
+    try:
+        with open(manifest_path, 'r', errors='ignore') as f:
+            content = f.read()
+        m = ast.literal_eval(content)
+        for pkg in m.get('external_dependencies', {}).get('python', []):
+            if pkg and isinstance(pkg, str):
+                deps.add(pkg)
+    except Exception:
+        pass
+print('\n'.join(sorted(deps)))
+PYEOF
+    ) 2>/dev/null || _more=""
+    [ -n "$_more" ] && _py_deps=$(printf '%s\n%s' "$_py_deps" "$_more")
+  done
+
+  # Deduplicate and build space-separated list for pip
+  local _pip_pkgs
+  _pip_pkgs=$(printf '%s\n' "$_py_deps" | grep -v '^$' | sort -u | tr '\n' ' ' | sed 's/ $//')
+
+  if [[ -z "$_pip_pkgs" ]]; then
+    print_info "No external Python dependencies declared in addons."
+  else
+    echo -e "  ${WHITE}Python packages required by addons:${NC} ${CYAN}${_pip_pkgs}${NC}"
+    print_info "Upgrading pip inside container (old pip can't parse modern packages)..."
+    dst "docker exec ${DST_INSTANCE_NAME}_odoo bash -c \
+      'pip3 install --upgrade pip setuptools --quiet'" || true
+    print_info "Installing Python dependencies..."
+    dst "docker exec ${DST_INSTANCE_NAME}_odoo pip3 install ${_pip_pkgs}" && \
+      print_success "Python dependencies installed: ${_pip_pkgs}" || \
+      print_warn "pip3 install had errors — check manually if Odoo fails to start."
+  fi
 }
 
 # ── STEP 9: Start Odoo container ──────────────────────────────
