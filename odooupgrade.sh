@@ -78,8 +78,9 @@ ODOO_MANAGER_META="$HOME/docker/.odoo_manager_instances"
 
 ADDON_PY_DEPS=""
 WORK_DIR="$HOME/odoo_upgrade_work"
-BACKUP_ZIP=""
-EXTRACT_DIR=""
+DUMP_FILE=""
+SRC_PG_USER=""
+SRC_PG_PASS=""
 
 # ── Prereqs ───────────────────────────────────────────────────────────────────
 check_prereqs() {
@@ -178,6 +179,17 @@ wizard() {
   [[ -n "$SRC_BASE_DIR"  ]] && print_success "Base dir     : ${SRC_BASE_DIR}"
   [[ -n "$SRC_FILESTORE" ]] && print_success "Filestore    : ${SRC_FILESTORE}"
   [[ -n "$SRC_ADDONS"    ]] && print_success "Addons       : ${SRC_ADDONS}"
+
+  # PG credentials from source odoo.conf (used for direct pg_dump later)
+  SRC_PG_USER=$(docker exec "$SRC_CONTAINER" bash -c \
+    "grep -E '^[[:space:]]*db_user[[:space:]]*=' /etc/odoo/odoo.conf 2>/dev/null \
+     | head -1 | sed 's/^[^=]*=//' | tr -d ' \r'" 2>/dev/null || true)
+  [[ -z "$SRC_PG_USER" || "$SRC_PG_USER" == "False" ]] && SRC_PG_USER="odoo"
+  SRC_PG_PASS=$(docker exec "$SRC_CONTAINER" bash -c \
+    "grep -E '^[[:space:]]*db_password[[:space:]]*=' /etc/odoo/odoo.conf 2>/dev/null \
+     | head -1 | sed 's/^[^=]*=//' | tr -d ' \r'" 2>/dev/null || true)
+  [[ "$SRC_PG_PASS" == "False" ]] && SRC_PG_PASS=""
+  print_success "PG user      : ${SRC_PG_USER}"
 
   # ── 3. Source master password ─────────────────────────────────────────────
   echo ""
@@ -363,86 +375,70 @@ EOF
 }
 
 # ── Step 2: Download backup via Odoo API ─────────────────────────────────────
-step_download_backup() {
-  print_step "Step 2 of 7 — Download backup from source Odoo (master password)"
+# ── Step 2: Direct pg_dump from source PostgreSQL container ──────────────────
+step_dump_db() {
+  print_step "Step 2 of 7 — Dump source database (direct pg_dump)"
   print_line
-  print_info "Calling POST /web/database/backup on source — nothing is modified."
+  print_info "Running pg_dump inside ${SRC_DB_CONTAINER} — source is never modified."
   print_warn "Large databases may take several minutes."
   echo ""
 
   mkdir -p "$WORK_DIR"
-  EXTRACT_DIR="$WORK_DIR/${SRC_DB}_extract"
+  DUMP_FILE="$WORK_DIR/${SRC_DB}_$(date +%Y%m%d_%H%M%S).sql"
 
-  local _attempt _is_zip _code _sz
-  for _attempt in 1 2 3; do
-    rm -f "$WORK_DIR/${SRC_DB}_"*.zip 2>/dev/null || true
-    BACKUP_ZIP="$WORK_DIR/${SRC_DB}_$(date +%Y%m%d_%H%M%S).zip"
+  local _ok=false _err_file="/tmp/_pgdump_err_$$"
 
-    local _code_file="$WORK_DIR/.http_$$"
-    curl \
-      --connect-timeout 30 --max-time 7200 \
-      -w "%{http_code}" \
-      -o "$BACKUP_ZIP" \
-      --progress-bar \
-      -X POST "http://localhost:${SRC_PORT}/web/database/backup" \
-      -F "master_pwd=${SRC_MASTER_PASS}" \
-      -F "name=${SRC_DB}" \
-      -F "backup_format=zip" \
-      > "$_code_file" 2>/dev/null
-    echo ""
+  # Method 1: Unix socket (trust auth — PostgreSQL Docker default for local)
+  print_info "Attempting pg_dump via Unix socket..."
+  if docker exec "$SRC_DB_CONTAINER" \
+      pg_dump -U "$SRC_PG_USER" --no-owner --no-acl -Fp "$SRC_DB" \
+      > "$DUMP_FILE" 2>"$_err_file"; then
+    _ok=true
+  else
+    local _e; _e=$(cat "$_err_file" 2>/dev/null || true)
+    print_warn "Unix socket failed: ${_e:-unknown error}"
+    rm -f "$DUMP_FILE"
+  fi
 
-    _code=$(cat "$_code_file" 2>/dev/null || echo "000")
-    rm -f "$_code_file"
-    _code="${_code//[^0-9]/}"
-    _sz=$(du -sh "$BACKUP_ZIP" | cut -f1)
-
-    # Check magic bytes — a real ZIP starts with PK (0x504B)
-    _is_zip=$(python3 -c \
-      "f=open('${BACKUP_ZIP}','rb'); print('yes' if f.read(2)==b'PK' else 'no')" \
-      2>/dev/null || echo "no")
-
-    if [[ "$_is_zip" == "yes" ]]; then
-      print_success "Backup downloaded (${_sz})"
-      break
-    fi
-
-    # Extract Odoo's error text from the HTML response
-    local _odoo_err
-    _odoo_err=$(python3 -c "
-import re, sys
-html = open('${BACKUP_ZIP}', errors='replace').read()
-# Odoo wrong-password error appears in <p class='alert-danger'> or similar
-for pat in [r'alert-danger[^>]*>\s*([^<]{10,})', r'<p>([^<]{10,})</p>', r'<pre>([^<]+)</pre>']:
-    m = re.search(pat, html, re.S)
-    if m:
-        print(m.group(1).strip()[:200]); break
-" 2>/dev/null || true)
-
-    echo ""
-    print_error "Backup failed (HTTP ${_code:-000}, ${_sz}) — response is not a ZIP."
-    if [[ -n "$_odoo_err" ]]; then
-      print_warn "Odoo says: ${_odoo_err}"
-    fi
-    rm -f "$BACKUP_ZIP"
-
-    if [[ $_attempt -lt 3 ]]; then
-      echo ""
-      print_info "Retry ${_attempt}/3 — re-enter the master password:"
-      ask_secret "Master password" SRC_MASTER_PASS
-      [[ -z "$SRC_MASTER_PASS" ]] && die "Master password cannot be empty."
+  # Method 2: TCP 127.0.0.1 with PGPASSWORD
+  if [[ "$_ok" == false ]]; then
+    print_info "Attempting pg_dump via TCP with password..."
+    if docker exec -e "PGPASSWORD=${SRC_PG_PASS}" "$SRC_DB_CONTAINER" \
+        pg_dump -U "$SRC_PG_USER" -h 127.0.0.1 --no-owner --no-acl -Fp "$SRC_DB" \
+        > "$DUMP_FILE" 2>"$_err_file"; then
+      _ok=true
     else
-      echo ""
-      print_info "Verify the correct master password with:"
-      print_info "  docker exec ${SRC_CONTAINER} grep admin_passwd /etc/odoo/odoo.conf"
-      die "Backup download failed after 3 attempts."
+      local _e; _e=$(cat "$_err_file" 2>/dev/null || true)
+      print_warn "TCP method failed: ${_e:-unknown error}"
+      rm -f "$DUMP_FILE"
     fi
-  done
+  fi
 
-  print_info "Extracting backup..."
-  rm -rf "$EXTRACT_DIR"; mkdir -p "$EXTRACT_DIR"
-  python3 -c "import zipfile,sys; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])" \
-    "$BACKUP_ZIP" "$EXTRACT_DIR" || die "Failed to extract backup ZIP."
-  print_success "Extracted to ${EXTRACT_DIR}"
+  # Method 3: As postgres superuser (fallback for stock PostgreSQL images)
+  if [[ "$_ok" == false ]]; then
+    print_info "Attempting pg_dump as postgres superuser..."
+    if docker exec "$SRC_DB_CONTAINER" \
+        pg_dump -U postgres --no-owner --no-acl -Fp "$SRC_DB" \
+        > "$DUMP_FILE" 2>"$_err_file"; then
+      _ok=true
+    else
+      local _e; _e=$(cat "$_err_file" 2>/dev/null || true)
+      print_warn "Superuser method failed: ${_e:-unknown error}"
+      rm -f "$DUMP_FILE"
+    fi
+  fi
+
+  rm -f "$_err_file" 2>/dev/null || true
+
+  if [[ "$_ok" == false ]]; then
+    print_error "All pg_dump methods failed."
+    print_info "Manual check:"
+    print_info "  docker exec ${SRC_DB_CONTAINER} pg_dump -U ${SRC_PG_USER} -l"
+    die "Cannot dump database. Verify ${SRC_DB_CONTAINER} is running."
+  fi
+
+  local sz; sz=$(du -sh "$DUMP_FILE" | cut -f1)
+  print_success "Database dumped (${sz}) → ${DUMP_FILE}"
 }
 
 # ── Step 3: Start PostgreSQL + restore database ───────────────────────────────
@@ -471,10 +467,10 @@ step_restore_db() {
     "CREATE DATABASE \"${DST_DB}\" OWNER ${DST_PG_USER};" \
     || die "Could not create database."
 
-  print_info "Restoring dump.sql..."
+  print_info "Restoring database dump (this may take several minutes)..."
   docker exec -i "${DST_INSTANCE}_db" \
-    psql -U "${DST_PG_USER}" -d "${DST_DB}" \
-    < "${EXTRACT_DIR}/dump.sql" \
+    psql -q -U "${DST_PG_USER}" -d "${DST_DB}" \
+    < "$DUMP_FILE" 2>&1 | grep -vE '^(SET|COMMENT|CREATE|ALTER|INSERT|UPDATE|COPY|SELECT|DELETE|GRANT|REVOKE|SEQUENCE|TABLE|INDEX|TRIGGER|FUNCTION|PROCEDURE|TYPE|SCHEMA|EXTENSION|AGGREGATE| set_config|-+|\([0-9]+ row)' \
     || print_warn "psql had warnings (usually harmless). Continuing."
   print_success "Database restored"
 }
@@ -484,19 +480,16 @@ step_restore_filestore() {
   print_step "Step 4 of 7 — Copy filestore"
   print_line
 
-  local src=""
-  [[ -d "${EXTRACT_DIR}/filestore" ]] && src="${EXTRACT_DIR}/filestore"
-  [[ -z "$src" && -n "$SRC_FILESTORE" && -d "$SRC_FILESTORE" ]] && src="$SRC_FILESTORE"
-
-  if [[ -z "$src" ]]; then
-    print_warn "No filestore found — attachments will be missing."
+  if [[ -z "$SRC_FILESTORE" || ! -d "$SRC_FILESTORE" ]]; then
+    print_warn "Source filestore not found at: ${SRC_FILESTORE:-not detected}"
+    print_warn "Attachments (images, documents) will be missing."
     return 0
   fi
 
-  print_info "Copying filestore from ${src} ..."
-  rsync -a --info=progress2 "${src}/" "${DST_BASE_DIR}/filestore/"
+  print_info "Copying filestore from ${SRC_FILESTORE} ..."
+  rsync -a --info=progress2 "${SRC_FILESTORE}/" "${DST_BASE_DIR}/filestore/"
   chown -R 101:101 "${DST_BASE_DIR}/filestore/" 2>/dev/null || true
-  print_success "Filestore copied  (ownership set to odoo 101:101)"
+  print_success "Filestore copied (ownership set to odoo 101:101)"
 }
 
 # ── Step 5: Copy addons ───────────────────────────────────────────────────────
@@ -553,6 +546,7 @@ step_run_upgrade() {
     --entrypoint "" \
     odoo bash -c "
       python3 -m pip install --upgrade pip setuptools --quiet 2>/dev/null || true
+      python3 -m pip install --upgrade 'pyOpenSSL>=23.2.0' 'cryptography>=42.0.0' --quiet 2>/dev/null || true
       ${ADDON_PY_DEPS:+python3 -m pip install ${ADDON_PY_DEPS} --quiet 2>/dev/null || true}
       exec odoo -d '${DST_DB}' -u all --stop-after-init --no-http --workers=0 --logfile=''
     "
@@ -577,9 +571,11 @@ step_start_odoo() {
   cd "${DST_BASE_DIR}"
   docker compose up -d odoo
 
-  # Upgrade pip as root (avoids old-pip pyproject.toml failures)
+  # Upgrade pip as root and fix pyOpenSSL/cryptography version conflict
   docker exec -u root "${DST_INSTANCE}_odoo" \
     python3 -m pip install --upgrade pip setuptools --quiet 2>/dev/null || true
+  docker exec -u root "${DST_INSTANCE}_odoo" \
+    python3 -m pip install --upgrade 'pyOpenSSL>=23.2.0' 'cryptography>=42.0.0' --quiet 2>/dev/null || true
 
   if [[ -n "$ADDON_PY_DEPS" ]]; then
     print_info "Installing manifest-declared packages: ${ADDON_PY_DEPS}"
@@ -668,7 +664,7 @@ main() {
   check_prereqs
   wizard
   step_setup_files
-  step_download_backup
+  step_dump_db
   step_restore_db
   step_restore_filestore
   step_copy_addons
