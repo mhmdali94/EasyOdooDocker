@@ -1186,6 +1186,226 @@ install_tools_menu() {
   pause
 }
 
+# ── MONITOR DASHBOARD ─────────────────────────────────────────
+# Draws a colored block progress bar.  Usage: _mon_bar <pct> <width>
+_mon_bar() {
+  local pct=${1:-0} width=${2:-16} filled empty color bar="" i
+  (( pct > 100 )) && pct=100
+  filled=$(( pct * width / 100 ))
+  empty=$(( width - filled ))
+  if   (( pct >= 85 )); then color=$RED
+  elif (( pct >= 65 )); then color=$YELLOW
+  else color=$GREEN
+  fi
+  for ((i=0; i<filled; i++)); do bar+="█"; done
+  for ((i=0; i<empty;  i++)); do bar+="░"; done
+  printf "${color}%s${NC}" "$bar"
+}
+
+show_monitor() {
+  local _ref=20 _quit=false _key _hc_tmp
+  _hc_tmp="/tmp/_odoo_mon_hc_$$"
+  trap '_quit=true; rm -f "$_hc_tmp" 2>/dev/null' INT TERM
+
+  while [[ "$_quit" == false ]]; do
+    clear
+
+    # ── host memory (from /proc/meminfo) ──────────────────────────────────
+    local mT mA mU mP sT sF sU sP
+    mT=$(awk '/^MemTotal:/{print $2}'     /proc/meminfo 2>/dev/null || echo 2097152)
+    mA=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null || echo 524288)
+    sT=$(awk '/^SwapTotal:/{print $2}'    /proc/meminfo 2>/dev/null || echo 0)
+    sF=$(awk '/^SwapFree:/{print $2}'     /proc/meminfo 2>/dev/null || echo 0)
+    mU=$(( mT - mA ))
+    mP=$(( mT > 0 ? mU * 100 / mT : 0 ))
+    sU=$(( sT - sF ))
+    sP=$(( sT > 0 ? sU * 100 / sT : 0 ))
+    local mTg mUg sTg sUg
+    mTg=$(awk "BEGIN{printf \"%.1f\",${mT}/1048576}")
+    mUg=$(awk "BEGIN{printf \"%.1f\",${mU}/1048576}")
+    sTg=$(awk "BEGIN{printf \"%.1f\",${sT}/1048576}")
+    sUg=$(awk "BEGIN{printf \"%.1f\",${sU}/1048576}")
+    local load uptime_p ts
+    load=$(awk '{printf "%s  %s  %s",$1,$2,$3}' /proc/loadavg 2>/dev/null || echo "N/A")
+    uptime_p=$(uptime -p 2>/dev/null | sed 's/^up //' || echo "N/A")
+    ts=$(date '+%H:%M:%S')
+
+    # ── build port map from meta file ─────────────────────────────────────
+    unset _pmap; declare -A _pmap
+    if [[ -f "$META_FILE" ]]; then
+      while IFS='|' read -r _n _v _d _wp _rest || [[ -n "$_n" ]]; do
+        [[ -z "$_n" || "$_n" == \#* || -z "$_wp" ]] && continue
+        _pmap["${_n}-app"]="$_wp"
+        _pmap["${_n}_odoo"]="$_wp"
+        _pmap["${_n}-odoo"]="$_wp"
+      done < "$META_FILE"
+    fi
+
+    # ── fire health checks in parallel (TCP port probe) ───────────────────
+    rm -f "$_hc_tmp"
+    for _k in "${!_pmap[@]}"; do
+      local _wp="${_pmap[$_k]}"
+      [[ -z "$_wp" ]] && continue
+      (
+        if timeout 2 bash -c "echo >/dev/tcp/127.0.0.1/${_wp}" 2>/dev/null; then
+          printf '%s=UP\n' "$_k"
+        else
+          printf '%s=DOWN\n' "$_k"
+        fi
+      ) >> "$_hc_tmp" &
+    done
+
+    # ── capture docker stats while health checks run in background ─────────
+    local _stats
+    _stats=$(docker stats --no-stream \
+      --format "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.BlockIO}}" \
+      2>/dev/null)
+
+    wait  # wait for all health check subshells
+
+    # collect health check results into associative array
+    unset _hcm; declare -A _hcm
+    if [[ -f "$_hc_tmp" ]]; then
+      while IFS='=' read -r _k _v; do
+        [[ -n "$_k" ]] && _hcm["$_k"]="$_v"
+      done < "$_hc_tmp"
+      rm -f "$_hc_tmp"
+    fi
+
+    # ── header banner ─────────────────────────────────────────────────────
+    echo -e "${CYAN}${BOLD}"
+    echo "  ╔═══════════════════════════════════════════════════════════════╗"
+    printf "  ║  📊  ODOO SERVER MONITOR       %s    ↻%ds  [q]uit   ║\n" "$ts" "$_ref"
+    echo "  ╠═══════════════════════════════════════════════════════════════╣"
+    printf "  ║  🖥  LOAD: %-18s  UP: %-24s ║\n" "$load" "$uptime_p"
+    echo "  ╚═══════════════════════════════════════════════════════════════╝${NC}"
+    echo ""
+
+    # ── host RAM / SWAP bars ───────────────────────────────────────────────
+    printf "  ${WHITE}RAM${NC}  "; _mon_bar "$mP" 22
+    printf "  ${WHITE}%s${NC}/${WHITE}%s${NC} GB  " "$mUg" "$mTg"
+    if   (( mP >= 90 )); then echo -e "${RED}${BOLD}${mP}%%  🔥 CRITICAL — containers are swapping to disk!${NC}"
+    elif (( mP >= 75 )); then echo -e "${YELLOW}${mP}%%  ⚠ HIGH — performance degraded${NC}"
+    elif (( mP >= 55 )); then echo -e "${YELLOW}${mP}%%${NC}"
+    else                      echo -e "${GREEN}${mP}%%${NC}"
+    fi
+
+    if (( sT > 0 )); then
+      printf "  ${WHITE}SWP${NC}  "; _mon_bar "$sP" 22
+      printf "  ${WHITE}%s${NC}/${WHITE}%s${NC} GB  " "$sUg" "$sTg"
+      if (( sP >= 50 )); then
+        echo -e "${RED}${sP}%%  HEAVY SWAP — severe disk I/O bottleneck!${NC}"
+      else
+        echo -e "${CYAN}${sP}%%${NC}"
+      fi
+    else
+      echo -e "  ${GRAY}SWP  none${NC}  ${YELLOW}⚠ add swap to prevent OOM kills${NC}"
+    fi
+    echo ""
+
+    # ── container table ────────────────────────────────────────────────────
+    printf "  ${BOLD}${WHITE}%-20s %-8s %-17s %-23s %-22s %s${NC}\n" \
+      "CONTAINER" "STATUS" "CPU" "RAM" "NET I/O (↓/↑)" "WEB"
+    echo -e "  ${GRAY}$(printf '─%.0s' {1..92})${NC}"
+
+    local _ndown=0 _warn_msgs=()
+
+    while IFS='|' read -r cname cpu mem_str mem_pc netio blockio; do
+      [[ -z "$cname" ]] && continue
+
+      # container running state
+      local cst; cst=$(docker inspect --format '{{.State.Status}}' "$cname" 2>/dev/null || echo "?")
+      local st_ico st_col
+      case "$cst" in
+        running)    st_ico="🟢 UP "; st_col=$GREEN  ;;
+        exited)     st_ico="🔴 DN "; st_col=$RED;   _ndown=$(( _ndown + 1 )) ;;
+        restarting) st_ico="🟡 RS "; st_col=$YELLOW ;;
+        *)          st_ico="⚪ ?? "; st_col=$GRAY   ;;
+      esac
+
+      # CPU progress bar (8 blocks)
+      local cn="${cpu//[^0-9.]/}"; cn="${cn%%.*}"; cn="${cn:-0}"
+      local cc; (( cn >= 80 )) && cc=$RED || { (( cn >= 40 )) && cc=$YELLOW || cc=$CYAN; }
+      local cb="" i
+      for ((i=0; i<8; i++)); do (( i < cn*8/100 )) && cb+="█" || cb+="░"; done
+
+      # RAM progress bar (10 blocks)
+      local rn="${mem_pc//[^0-9.]/}"; rn="${rn%%.*}"; rn="${rn:-0}"
+      local rc; (( rn >= 85 )) && rc=$RED || { (( rn >= 65 )) && rc=$YELLOW || rc=$GREEN; }
+      local rb=""
+      for ((i=0; i<10; i++)); do (( i < rn*10/100 )) && rb+="█" || rb+="░"; done
+
+      # classify container
+      local type_ico="${GRAY}📦${NC}" is_app=false is_db=false
+      if   [[ "$cname" == *-app   || "$cname" == *_odoo || "$cname" == *-odoo ]]; then
+        is_app=true; type_ico="${MAGENTA}🐘${NC}"
+      elif [[ "$cname" == *-db    || "$cname" == *_db   || "$cname" == *postgres* ]]; then
+        is_db=true;  type_ico="${BLUE}🗄${NC} "
+      fi
+
+      # web health (Odoo app containers only)
+      local web_str="${GRAY}—${NC}"
+      if [[ "$is_app" == true ]]; then
+        local wp="${_pmap[$cname]:-}"
+        if [[ -n "$wp" ]]; then
+          case "${_hcm[$cname]:-}" in
+            UP)   web_str="${GREEN}✅ :${wp}${NC}" ;;
+            DOWN) web_str="${RED}✖  :${wp}${NC}"; _warn_msgs+=("${cname}: port ${wp} not responding") ;;
+            *)    [[ "$cst" == "running" ]] \
+                    && web_str="${YELLOW}? :${wp}${NC}" \
+                    || web_str="${RED}— stopped${NC}" ;;
+          esac
+        else
+          web_str="${GRAY}(no port)${NC}"
+        fi
+      fi
+
+      # print row
+      printf "  ${type_ico} ${st_col}%-18s${NC} " "$cname"
+      printf "${st_col}%-7s${NC}  " "$st_ico"
+      printf "${cc}%s${NC} %-7s  " "$cb" "$cpu"
+      printf "${rc}%s${NC} %-21s  " "$rb" "$mem_str"
+      printf "${GRAY}%-22s${NC}  " "$netio"
+      echo -e "$web_str"
+
+    done <<< "$_stats"
+
+    echo -e "  ${GRAY}$(printf '─%.0s' {1..92})${NC}"
+    echo ""
+
+    # ── warnings / tips ────────────────────────────────────────────────────
+    if (( mP >= 75 )); then
+      echo -e "  ${YELLOW}⚠  Server RAM ${mP}% used (${mUg}/${mTg}GB) — all instances share this memory${NC}"
+    fi
+    if (( sT == 0 )); then
+      echo -e "  ${YELLOW}ℹ  No swap — if RAM fills, containers will be OOM-killed without warning${NC}"
+    fi
+    if (( _ndown > 0 )); then
+      echo -e "  ${RED}✖  ${_ndown} container(s) are DOWN${NC}"
+    fi
+    for _wm in "${_warn_msgs[@]}"; do
+      echo -e "  ${RED}✖  ${_wm}${NC}"
+    done
+    echo ""
+
+    # ── refresh countdown with q-to-quit ──────────────────────────────────
+    local s
+    for ((s=_ref; s>0; s--)); do
+      printf "\r  ${GRAY}↻ Refreshing in ${WHITE}%ds${GRAY} — press ${WHITE}q${GRAY} to return to menu   ${NC}" "$s"
+      read -r -t 1 -n 1 _key 2>/dev/null
+      local _re=$?
+      [[ $_re -eq 0 && ( "$_key" == "q" || "$_key" == "Q" ) ]] && { _quit=true; break; }
+      [[ "$_quit" == true ]] && break
+    done
+    printf "\r%95s\r" ""
+
+  done
+
+  trap - INT TERM
+  rm -f "$_hc_tmp" 2>/dev/null
+  echo ""
+}
+
 # ── MAIN MENU ─────────────────────────────────────────────────
 main_menu() {
   while true; do
@@ -1209,11 +1429,12 @@ main_menu() {
     echo -e "  ${RED}9)${NC} 🗑️   Delete instance"
     echo -e "  ${GRAY}10)${NC} 📥  Import existing instance"
     echo -e "  ${BLUE}11)${NC} 🛠️   Install optional tools ${GRAY}(Nginx Proxy Manager / Portainer)${NC}"
+    echo -e "  ${MAGENTA}12)${NC} 📊  Live server monitor ${GRAY}(CPU · RAM · Net · web health)${NC}"
     echo ""
     print_line
     echo -e "  ${GRAY}0) Exit${NC}"
     echo ""
-    read -rp "  $(echo -e "${WHITE}Choose [0-11]: ${NC}")" choice
+    read -rp "  $(echo -e "${WHITE}Choose [0-12]: ${NC}")" choice
 
     case $choice in
       1)  create_instance ;;
@@ -1227,6 +1448,7 @@ main_menu() {
       9)  delete_instance ;;
       10) import_existing ;;
       11) install_tools_menu ;;
+      12) show_monitor ;;
       0)  echo -e "\n  ${GREEN}Goodbye!${NC}\n"; exit 0 ;;
       *)  print_error "Invalid choice"; sleep 1 ;;
     esac
